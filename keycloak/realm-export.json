@@ -59,7 +59,7 @@
       "redirectUris": ["http://localhost:5173/*", "http://localhost:8080/*", "http://localhost:3000/*"],
       "webOrigins": ["http://localhost:5173", "http://localhost:8080", "http://localhost:3000"],
       "protocol": "openid-connect",
-      "defaultClientScopes": ["lattice-scopes"],
+      "defaultClientScopes": ["openid", "profile", "lattice-scopes"],
       "attributes": {
         "pkce.code.challenge.method": "S256"
       },
@@ -89,7 +89,7 @@
       "redirectUris": ["http://localhost/*", "http://127.0.0.1/*"],
       "webOrigins": ["http://localhost", "http://127.0.0.1"],
       "protocol": "openid-connect",
-      "defaultClientScopes": ["lattice-scopes"],
+      "defaultClientScopes": ["openid", "profile", "lattice-scopes"],
       "attributes": {
         "pkce.code.challenge.method": "S256"
       },
@@ -111,6 +111,71 @@
     }
   ],
   "clientScopes": [
+    {
+      "name": "openid",
+      "description": "OpenID Connect scope",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "sub",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-sub-mapper",
+          "config": {
+            "id.token.claim": "true",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "profile",
+      "description": "OpenID Connect profile scope",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "full name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-full-name-mapper",
+          "config": {
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "username",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "username",
+            "claim.name": "preferred_username",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "email",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "email",
+            "claim.name": "email",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
     {
       "name": "lattice-scopes",
       "description": "Lattice API scopes",
