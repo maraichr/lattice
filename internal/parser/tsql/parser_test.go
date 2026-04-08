@@ -516,7 +516,79 @@ DECLARE @UserID INT = 1;
 SELECT TOP 10 * FROM dbo.Users WITH (NOLOCK);
 GO
 `
-	if d := parser.DetectDialect([]byte(tsql)); d != "tsql" {
+	if d := parser.DetectDialect([]byte(tsql), ".sql"); d != "tsql" {
 		t.Errorf("expected tsql, got %s", d)
+	}
+}
+
+func TestTopLevelExecCreatesRefs(t *testing.T) {
+	input := `
+EXEC dbo.AddUser @Name = 'Test'
+GO
+EXEC dbo.UpdatePermissions
+GO
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "migration/001_seed.sql", Content: []byte(input)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should have a synthetic file symbol
+	var scriptSym *parser.Symbol
+	for i, s := range result.Symbols {
+		if s.Kind == "script" {
+			scriptSym = &result.Symbols[i]
+			break
+		}
+	}
+	if scriptSym == nil {
+		t.Fatal("expected a script symbol for top-level statements")
+	}
+	if !strings.HasPrefix(scriptSym.QualifiedName, "__file__:") {
+		t.Errorf("expected __file__: prefix, got %s", scriptSym.QualifiedName)
+	}
+
+	// Should have calls references
+	var callRefs []parser.RawReference
+	for _, r := range result.References {
+		if r.ReferenceType == "calls" {
+			callRefs = append(callRefs, r)
+		}
+	}
+	if len(callRefs) != 2 {
+		t.Fatalf("expected 2 calls refs from top-level EXEC, got %d", len(callRefs))
+	}
+
+	names := map[string]bool{}
+	for _, r := range callRefs {
+		names[r.ToName] = true
+	}
+	if !names["AddUser"] {
+		t.Error("missing calls ref to AddUser")
+	}
+	if !names["UpdatePermissions"] {
+		t.Error("missing calls ref to UpdatePermissions")
+	}
+}
+
+func TestTopLevelExecNoRefsWhenEmpty(t *testing.T) {
+	// When there are no top-level EXEC statements, no script symbol should be emitted
+	input := `
+CREATE TABLE dbo.Users (
+    ID INT PRIMARY KEY
+);
+GO
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "schema.sql", Content: []byte(input)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, s := range result.Symbols {
+		if s.Kind == "script" {
+			t.Error("unexpected script symbol when no top-level EXEC")
+		}
 	}
 }

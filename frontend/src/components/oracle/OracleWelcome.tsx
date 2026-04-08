@@ -8,7 +8,7 @@ const suggestedQuestions = [
   "Give me a project overview",
   "What are the most important tables?",
   "Show table relationships",
-  "What are the most used procedures?",
+  "Trace the full stack from app code to database",
 ];
 
 export function OracleWelcome({ onQuestionClick }: Props) {

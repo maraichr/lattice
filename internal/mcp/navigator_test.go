@@ -80,21 +80,21 @@ func TestSuggestNextSteps_SearchSymbols_DataSymbol(t *testing.T) {
 		t.Fatal("should return hints after search")
 	}
 
-	// First hint should be get_symbol_details
-	if hints.Steps[0].Tool != "get_symbol_details" {
-		t.Errorf("first hint should be get_symbol_details, got %s", hints.Steps[0].Tool)
+	// First hint should be search_symbols (refine)
+	if hints.Steps[0].Tool != "search_symbols" {
+		t.Errorf("first hint should be search_symbols, got %s", hints.Steps[0].Tool)
 	}
 
-	// For data symbols, should suggest trace_lineage
+	// For data symbols, should suggest get_lineage
 	found := false
 	for _, s := range hints.Steps {
-		if s.Tool == "trace_lineage" {
+		if s.Tool == "get_lineage" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Error("data symbol search should suggest trace_lineage")
+		t.Error("data symbol search should suggest get_lineage")
 	}
 }
 
@@ -109,13 +109,13 @@ func TestSuggestNextSteps_SearchSymbols_CodeSymbol(t *testing.T) {
 
 	found := false
 	for _, s := range hints.Steps {
-		if s.Tool == "get_dependencies" {
+		if s.Tool == "extract_subgraph" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Error("code symbol search should suggest get_dependencies")
+		t.Error("code symbol search should suggest extract_subgraph")
 	}
 }
 
@@ -142,7 +142,7 @@ func TestSuggestNextSteps_SearchSymbols_ManyResults(t *testing.T) {
 func TestSuggestNextSteps_Details(t *testing.T) {
 	nav := NewNavigator(nil)
 	syms := []postgres.Symbol{makeSymbol("CustomerRepo", "class", "app.CustomerRepo")}
-	hints := nav.SuggestNextSteps("get_symbol_details", syms, nil)
+	hints := nav.SuggestNextSteps("extract_subgraph", syms, nil)
 
 	if hints == nil || len(hints.Steps) < 2 {
 		t.Fatal("details should suggest at least 2 steps")
@@ -152,35 +152,35 @@ func TestSuggestNextSteps_Details(t *testing.T) {
 	for _, s := range hints.Steps {
 		tools[s.Tool] = true
 	}
-	if !tools["get_dependencies"] {
-		t.Error("should suggest get_dependencies")
+	if !tools["extract_subgraph"] {
+		t.Error("should suggest extract_subgraph")
 	}
-	if !tools["find_usages"] {
-		t.Error("should suggest find_usages")
+	if !tools["analyze_impact"] {
+		t.Error("should suggest analyze_impact")
 	}
 }
 
 func TestSuggestNextSteps_Details_DataSymbol(t *testing.T) {
 	nav := NewNavigator(nil)
 	syms := []postgres.Symbol{makeSymbol("Customers", "table", "dbo.Customers")}
-	hints := nav.SuggestNextSteps("get_symbol_details", syms, nil)
+	hints := nav.SuggestNextSteps("extract_subgraph", syms, nil)
 
 	found := false
 	for _, s := range hints.Steps {
-		if s.Tool == "trace_lineage" {
+		if s.Tool == "get_lineage" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Error("data symbol details should suggest trace_lineage")
+		t.Error("data symbol details should suggest get_lineage")
 	}
 }
 
 func TestSuggestNextSteps_Details_CodeSymbol(t *testing.T) {
 	nav := NewNavigator(nil)
 	syms := []postgres.Symbol{makeSymbol("Process", "method", "app.Service.Process")}
-	hints := nav.SuggestNextSteps("get_symbol_details", syms, nil)
+	hints := nav.SuggestNextSteps("extract_subgraph", syms, nil)
 
 	found := false
 	for _, s := range hints.Steps {
@@ -217,7 +217,7 @@ func TestSuggestNextSteps_MaxThreeHints(t *testing.T) {
 	for i := range 10 {
 		syms[i] = makeSymbol("Sym", "class", "app.Sym")
 	}
-	hints := nav.SuggestNextSteps("get_dependencies", syms, nil)
+	hints := nav.SuggestNextSteps("extract_subgraph", syms, nil)
 	if hints != nil && len(hints.Steps) > 3 {
 		t.Errorf("should cap at 3 hints, got %d", len(hints.Steps))
 	}
@@ -231,8 +231,8 @@ func TestSuggestNextSteps_UnknownTool(t *testing.T) {
 	if hints == nil || len(hints.Steps) == 0 {
 		t.Fatal("unknown tool should return default hints")
 	}
-	if hints.Steps[0].Tool != "get_symbol_details" {
-		t.Errorf("default hint should be get_symbol_details, got %s", hints.Steps[0].Tool)
+	if hints.Steps[0].Tool != "search_symbols" {
+		t.Errorf("default hint should be search_symbols, got %s", hints.Steps[0].Tool)
 	}
 }
 
@@ -243,15 +243,21 @@ func TestSuggestNextSteps_HintsContainParams(t *testing.T) {
 
 	for _, step := range hints.Steps {
 		if step.Params != nil {
-			if id, ok := step.Params["symbol_id"]; ok {
-				if id != sym.ID.String() {
-					t.Errorf("param symbol_id should match %s, got %s", sym.ID, id)
+			if val, ok := step.Params["query"]; ok {
+				if val != sym.Name {
+					t.Errorf("param query should match %s, got %s", sym.Name, val)
+				}
+				return
+			}
+			if val, ok := step.Params["symbol_name"]; ok {
+				if val != sym.Name {
+					t.Errorf("param symbol_name should match %s, got %s", sym.Name, val)
 				}
 				return
 			}
 		}
 	}
-	t.Error("at least one hint should include symbol_id param")
+	t.Error("at least one hint should include query or symbol_name param")
 }
 
 func TestSuggestNextSteps_HintsHaveTokenEstimates(t *testing.T) {

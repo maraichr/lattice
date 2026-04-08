@@ -2,35 +2,36 @@ package ingestion
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/maraichr/lattice/internal/parser"
 	"github.com/maraichr/lattice/internal/store"
 	"github.com/maraichr/lattice/internal/store/postgres"
+	"github.com/valkey-io/valkey-go"
 )
 
-// ParseStage walks the work directory, parses SQL files, and persists results.
+// ParseStage walks the work directory, groups files into chunks, and enqueues
+// each chunk to the lattice:parse_tasks stream for distributed processing.
+// It does not parse files directly; parse workers handle the actual parsing.
 type ParseStage struct {
-	registry *parser.Registry
-	store    *store.Store
+	store  *store.Store
+	client valkey.Client
 }
 
-func NewParseStage(registry *parser.Registry, store *store.Store) *ParseStage {
-	return &ParseStage{registry: registry, store: store}
+func NewParseStage(store *store.Store, client valkey.Client) *ParseStage {
+	return &ParseStage{store: store, client: client}
 }
 
 func (s *ParseStage) Name() string { return "parse" }
 
 func (s *ParseStage) Execute(ctx context.Context, rc *IndexRunContext) error {
 	if rc.WorkDir == "" {
-		return nil // no files to parse (e.g., no clone stage ran)
+		return nil
 	}
 
-	// Handle incremental: delete symbols for removed files
+	// Handle incremental: delete symbols for removed files before enqueuing parse tasks.
 	if rc.Incremental && len(rc.DeletedFiles) > 0 {
 		for _, delPath := range rc.DeletedFiles {
 			file, err := s.store.GetFileByPath(ctx, postgres.GetFileByPathParams{
@@ -39,42 +40,28 @@ func (s *ParseStage) Execute(ctx context.Context, rc *IndexRunContext) error {
 				Path:      delPath,
 			})
 			if err != nil {
-				continue // file may not exist
+				continue
 			}
 			_ = s.store.DeleteSymbolsByFileID(ctx, file.ID)
 		}
 	}
 
-	var results []parser.FileResult
-
+	// Collect the list of files to parse.
+	var files []string
 	if rc.Incremental && len(rc.ChangedFiles) > 0 {
-		// Incremental: only parse changed files
 		for _, relPath := range rc.ChangedFiles {
 			absPath := filepath.Join(rc.WorkDir, relPath)
-			info, err := os.Stat(absPath)
-			if err != nil {
-				continue // file might not exist
-			}
-			fr := s.parseFile(rc, absPath, relPath, info)
-			if fr != nil {
-				results = append(results, *fr)
+			if _, err := os.Stat(absPath); err == nil {
+				files = append(files, relPath)
 			}
 		}
 	} else {
-		// Full scan
 		err := filepath.Walk(rc.WorkDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
+			if err != nil || info.IsDir() {
 				return err
 			}
-			if info.IsDir() {
-				return nil
-			}
-
 			relPath, _ := filepath.Rel(rc.WorkDir, path)
-			fr := s.parseFile(rc, path, relPath, info)
-			if fr != nil {
-				results = append(results, *fr)
-			}
+			files = append(files, relPath)
 			return nil
 		})
 		if err != nil {
@@ -82,65 +69,47 @@ func (s *ParseStage) Execute(ctx context.Context, rc *IndexRunContext) error {
 		}
 	}
 
-	files, symbols, edges, err := PersistResults(ctx, s.store, results)
-	if err != nil {
-		return fmt.Errorf("persist results: %w", err)
+	if len(files) == 0 {
+		return nil
 	}
 
-	rc.FilesProcessed = files
-	rc.SymbolsFound = symbols
-	rc.EdgesFound = edges
-	rc.ParseResults = results
+	// Split files into chunks and enqueue each chunk.
+	chunks := chunkStrings(files, ParseTaskChunkSize)
+	totalChunks := len(chunks)
 
+	for i, chunk := range chunks {
+		task := ParseTaskMessage{
+			IndexRunID:          rc.IndexRunID,
+			ProjectID:           rc.ProjectID,
+			SourceID:            rc.SourceID,
+			SourceType:          rc.SourceType,
+			WorkDir:             rc.WorkDir,
+			ChunkIndex:          i,
+			TotalChunks:         totalChunks,
+			Files:               chunk,
+			LineageExcludePaths: rc.LineageExcludePaths,
+		}
+		if _, err := EnqueueParseTask(ctx, s.client, task); err != nil {
+			return fmt.Errorf("enqueue parse chunk %d/%d: %w", i+1, totalChunks, err)
+		}
+	}
+
+	rc.TotalChunks = totalChunks
 	return nil
 }
 
-func (s *ParseStage) parseFile(rc *IndexRunContext, absPath, relPath string, info os.FileInfo) *parser.FileResult {
-	p := s.registry.ForFile(absPath)
-	if p == nil {
-		return nil
+// chunkStrings splits a slice into sub-slices of at most size n.
+func chunkStrings(items []string, n int) [][]string {
+	var chunks [][]string
+	for len(items) > 0 {
+		end := n
+		if end > len(items) {
+			end = len(items)
+		}
+		chunks = append(chunks, items[:end])
+		items = items[end:]
 	}
-
-	content, err := os.ReadFile(absPath)
-	if err != nil {
-		return nil
-	}
-
-	// Detect SQL dialect for SQL files
-	ext := strings.ToLower(filepath.Ext(absPath))
-	language := "sql"
-	if ext == ".sql" || ext == ".sqldataprovider" {
-		language = parser.DetectDialect(content)
-	}
-
-	// Classify migration/schema files: skip column-level lineage to avoid direct_copy explosion
-	skipColumnLineage := isMigrationOrSchemaFile(relPath, rc.LineageExcludePaths)
-
-	input := parser.FileInput{
-		Path:              relPath,
-		Content:           content,
-		Language:          language,
-		SkipColumnLineage: skipColumnLineage,
-	}
-
-	result, err := p.Parse(input)
-	if err != nil {
-		return nil
-	}
-
-	hash := fmt.Sprintf("%x", sha256.Sum256(content))
-
-	return &parser.FileResult{
-		ProjectID:        rc.ProjectID,
-		SourceID:         rc.SourceID,
-		Path:             relPath,
-		Language:         language,
-		SizeBytes:        info.Size(),
-		Hash:             hash,
-		Symbols:          result.Symbols,
-		References:       result.References,
-		ColumnReferences: result.ColumnReferences,
-	}
+	return chunks
 }
 
 // isMigrationOrSchemaFile returns true for paths that look like migration or schema DDL
@@ -154,7 +123,6 @@ func isMigrationOrSchemaFile(relPath string, lineageExcludePaths []string) bool 
 		strings.Contains(lower, "/migrations/") || strings.Contains(lower, "/scripts/") {
 		return true
 	}
-	// DNN Platform conventions: DataProvider SQL and schema under these paths
 	if strings.Contains(lower, "dnn platform/") || strings.Contains(lower, "dnn.adminexperience/") ||
 		strings.Contains(lower, "providers/") {
 		return true
@@ -167,7 +135,6 @@ func isMigrationOrSchemaFile(relPath string, lineageExcludePaths []string) bool 
 		if matched {
 			return true
 		}
-		// Also support simple substring match if pattern has no glob chars
 		if !strings.ContainsAny(pattern, "*?[\\") && strings.Contains(lower, strings.ToLower(pattern)) {
 			return true
 		}

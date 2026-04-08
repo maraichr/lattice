@@ -94,9 +94,19 @@ func seedEvalGraph(t *testing.T, s *store.Store) (projectSlug string, cleanup fu
 	ctx := context.Background()
 	slug := fmt.Sprintf("eval-agent-%s", t.Name())
 
+	tenant, err := s.CreateTenant(ctx, postgres.CreateTenantParams{
+		Name:     "eval-tenant",
+		Slug:     slug + "-tenant",
+		Settings: []byte("{}"),
+	})
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
 	proj, err := s.CreateProject(ctx, postgres.CreateProjectParams{
-		Name: "Agent Eval Project",
-		Slug: slug,
+		Name:     "Agent Eval Project",
+		Slug:     slug,
+		TenantID: tenant.ID,
 	})
 	if err != nil {
 		t.Fatalf("create project: %v", err)
@@ -164,6 +174,24 @@ func seedEvalGraph(t *testing.T, s *store.Store) (projectSlug string, cleanup fu
 		t.Fatalf("create method: %v", err)
 	}
 
+	// C# file and symbol for cross-language tests
+	csFile, err := s.UpsertFile(ctx, postgres.UpsertFileParams{
+		ProjectID: proj.ID, SourceID: source.ID,
+		Path: "repository.cs", Language: "csharp", SizeBytes: 1500, Hash: "eval3",
+	})
+	if err != nil {
+		t.Fatalf("create cs file: %v", err)
+	}
+
+	csClass, err := s.CreateSymbol(ctx, postgres.CreateSymbolParams{
+		ProjectID: proj.ID, FileID: csFile.ID,
+		Name: "CustomerService", QualifiedName: "App.Services.CustomerService",
+		Kind: "class", Language: "csharp", StartLine: 1, EndLine: 60,
+	})
+	if err != nil {
+		t.Fatalf("create cs class: %v", err)
+	}
+
 	// Edges: proc→table (reads_from), class→proc (calls), method→table (reads_from)
 	s.CreateSymbolEdge(ctx, postgres.CreateSymbolEdgeParams{
 		ProjectID: proj.ID, SourceID: proc.ID, TargetID: table.ID, EdgeType: "reads_from",
@@ -173,6 +201,16 @@ func seedEvalGraph(t *testing.T, s *store.Store) (projectSlug string, cleanup fu
 	})
 	s.CreateSymbolEdge(ctx, postgres.CreateSymbolEdgeParams{
 		ProjectID: proj.ID, SourceID: method.ID, TargetID: table.ID, EdgeType: "reads_from",
+	})
+
+	// Cross-language edges: csClass → proc (calls), csClass → table (uses_table) with metadata
+	s.CreateSymbolEdgeWithMetadata(ctx, postgres.CreateSymbolEdgeWithMetadataParams{
+		ProjectID: proj.ID, SourceID: csClass.ID, TargetID: proc.ID, EdgeType: "calls",
+		Metadata: []byte(`{"confidence": 0.85, "bridge": "csharp→tsql"}`),
+	})
+	s.CreateSymbolEdgeWithMetadata(ctx, postgres.CreateSymbolEdgeWithMetadataParams{
+		ProjectID: proj.ID, SourceID: csClass.ID, TargetID: table.ID, EdgeType: "uses_table",
+		Metadata: []byte(`{"confidence": 0.95, "bridge": "csharp→tsql"}`),
 	})
 
 	// Compute analytics (PageRank, degrees, layers, summaries, bridges)
@@ -188,6 +226,7 @@ func seedEvalGraph(t *testing.T, s *store.Store) (projectSlug string, cleanup fu
 		s.Pool().Exec(ctx, "DELETE FROM sources WHERE project_id = $1", proj.ID)
 		s.Pool().Exec(ctx, "DELETE FROM project_analytics WHERE project_id = $1", proj.ID)
 		s.Pool().Exec(ctx, "DELETE FROM projects WHERE id = $1", proj.ID)
+		s.Pool().Exec(ctx, "DELETE FROM tenants WHERE id = $1", tenant.ID)
 	}
 
 	return slug, cleanup
@@ -293,6 +332,96 @@ func TestAgentEval_CrossLanguageBridges(t *testing.T) {
 	// Efficiency: overview + possibly one follow-up
 	if result.ToolCalls > 5 {
 		t.Errorf("expected ≤5 tool calls, got %d", result.ToolCalls)
+	}
+}
+
+func TestAgentEval_CrossLanguageTrace(t *testing.T) {
+	h, s, _ := setupHarness(t)
+	slug, cleanup := seedEvalGraph(t, s)
+	defer cleanup()
+
+	ctx := context.Background()
+	question := fmt.Sprintf("Using project '%s': What's the full stack trace for GetCustomer? Show me how code flows from C# to SQL.", slug)
+
+	result, err := h.Run(ctx, question)
+	if err != nil {
+		t.Fatalf("agent run failed: %v", err)
+	}
+
+	t.Logf("Question: %s", result.Question)
+	t.Logf("Answer: %s", result.FinalAnswer)
+	t.Logf("Tool calls: %d, Turns: %d, Tokens: %d", result.ToolCalls, result.Turns, result.TotalTokens)
+	t.Logf("Tool sequence: %v", result.ToolSequence)
+
+	lower := strings.ToLower(result.FinalAnswer)
+	hasCSharp := strings.Contains(lower, "c#") || strings.Contains(lower, "csharp") || strings.Contains(lower, "customerservice")
+	hasSQL := strings.Contains(lower, "tsql") || strings.Contains(lower, "sql") || strings.Contains(lower, "getcustomer") || strings.Contains(lower, "customers")
+	if !hasCSharp || !hasSQL {
+		t.Errorf("expected answer to mention both C# and T-SQL symbols, got: %s", result.FinalAnswer)
+	}
+	if result.ToolCalls > 5 {
+		t.Errorf("expected ≤5 tool calls, got %d", result.ToolCalls)
+	}
+}
+
+func TestAgentEval_ImpactAnalysis(t *testing.T) {
+	h, s, _ := setupHarness(t)
+	slug, cleanup := seedEvalGraph(t, s)
+	defer cleanup()
+
+	ctx := context.Background()
+	question := fmt.Sprintf("Using project '%s': What would break if I rename the Customers table?", slug)
+
+	result, err := h.Run(ctx, question)
+	if err != nil {
+		t.Fatalf("agent run failed: %v", err)
+	}
+
+	t.Logf("Question: %s", result.Question)
+	t.Logf("Answer: %s", result.FinalAnswer)
+	t.Logf("Tool calls: %d, Turns: %d, Tokens: %d", result.ToolCalls, result.Turns, result.TotalTokens)
+	t.Logf("Tool sequence: %v", result.ToolSequence)
+
+	lower := strings.ToLower(result.FinalAnswer)
+	hasProc := strings.Contains(lower, "getcustomer")
+	hasClass := strings.Contains(lower, "customerservice") || strings.Contains(lower, "customerrepository")
+	if !hasProc && !hasClass {
+		t.Errorf("expected answer to mention GetCustomer or CustomerService/CustomerRepository, got: %s", result.FinalAnswer)
+	}
+	if result.ToolCalls > 4 {
+		t.Errorf("expected ≤4 tool calls, got %d", result.ToolCalls)
+	}
+}
+
+func TestAgentEval_LineageTrace(t *testing.T) {
+	h, s, _ := setupHarness(t)
+	slug, cleanup := seedEvalGraph(t, s)
+	defer cleanup()
+
+	ctx := context.Background()
+	question := fmt.Sprintf("Using project '%s': Where does the data in Customers table come from?", slug)
+
+	result, err := h.Run(ctx, question)
+	if err != nil {
+		t.Fatalf("agent run failed: %v", err)
+	}
+
+	t.Logf("Question: %s", result.Question)
+	t.Logf("Answer: %s", result.FinalAnswer)
+	t.Logf("Tool calls: %d, Turns: %d, Tokens: %d", result.ToolCalls, result.Turns, result.TotalTokens)
+	t.Logf("Tool sequence: %v", result.ToolSequence)
+
+	lower := strings.ToLower(result.FinalAnswer)
+	hasCaller := strings.Contains(lower, "getcustomer") ||
+		strings.Contains(lower, "customerservice") ||
+		strings.Contains(lower, "customerrepository") ||
+		strings.Contains(lower, "getbyid") ||
+		strings.Contains(lower, "upstream")
+	if !hasCaller {
+		t.Errorf("expected answer to mention upstream callers, got: %s", result.FinalAnswer)
+	}
+	if result.ToolCalls > 4 {
+		t.Errorf("expected ≤4 tool calls, got %d", result.ToolCalls)
 	}
 }
 

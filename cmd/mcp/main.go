@@ -16,6 +16,7 @@ import (
 	"github.com/maraichr/lattice/internal/auth"
 	"github.com/maraichr/lattice/internal/config"
 	"github.com/maraichr/lattice/internal/embedding"
+	"github.com/maraichr/lattice/internal/llm"
 	"github.com/maraichr/lattice/internal/mcp"
 	"github.com/maraichr/lattice/internal/mcp/tools"
 	"github.com/maraichr/lattice/internal/store"
@@ -65,17 +66,25 @@ func main() {
 		logger.Info("embedder configured", slog.String("model", embedder.ModelID()))
 	}
 
+	// LLM client (optional — enables intelligent intent routing in ask_codebase)
+	var llmClient *llm.Client
+	if cfg.OpenRouter.APIKey != "" {
+		llmClient = llm.NewClient(cfg.OpenRouter.APIKey, cfg.Oracle.Model, cfg.OpenRouter.BaseURL)
+		logger.Info("LLM routing enabled for ask_codebase", slog.String("model", cfg.Oracle.Model))
+	}
+
 	// Create MCP server with infrastructure
 	mcpServer := mcp.NewServer(mcp.ServerDeps{
 		Store:        s,
 		ValkeyClient: vkClient,
 		Embedder:     embedder,
+		LLM:          llmClient,
 		Logger:       logger,
 	})
 
 	// Wire tool handlers (in cmd to avoid import cycle mcp <-> mcp/tools)
 	extractSubgraph := tools.NewExtractSubgraphHandler(s, mcpServer.Session, embedder, logger)
-	askCodebase := tools.NewAskCodebaseHandler(s, mcpServer.Session, embedder, logger)
+	askCodebase := tools.NewAskCodebaseHandler(s, mcpServer.Session, embedder, mcpServer.LLM, logger)
 	listProjects := tools.NewListProjectsHandler(s, logger)
 	searchSymbols := tools.NewSearchSymbolsHandler(s, mcpServer.Session, logger)
 	getLineage := tools.NewGetLineageHandler(s, logger)

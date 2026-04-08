@@ -11,6 +11,17 @@ import (
 )
 
 // Pipeline orchestrates the indexing stages for each ingestion job.
+//
+// # Two-phase execution model
+//
+// Phase 1 (initial trigger — any trigger except "parse_complete"):
+//   CloneStage → ParseStage (enqueues chunks to lattice:parse_tasks, sets rc.TotalChunks)
+//   Pipeline halts here. ParseWorkers run concurrently; the last worker re-enqueues
+//   an IngestMessage with Trigger="parse_complete" back to lattice:ingest.
+//
+// Phase 2 (Trigger == "parse_complete"):
+//   Clone and Parse stages are skipped. The pipeline resumes from ResolveStage onward.
+//   Stages that should only run in phase 2 must implement SkipInPhase1() bool returning true.
 type Pipeline struct {
 	store  *store.Store
 	stages []Stage
@@ -21,18 +32,23 @@ func NewPipeline(s *store.Store, stages []Stage, logger *slog.Logger) *Pipeline 
 	return &Pipeline{store: s, stages: stages, logger: logger}
 }
 
-// Run processes a single ingestion message through all pipeline stages.
+// Run processes a single ingestion message through the appropriate pipeline phase.
 func (p *Pipeline) Run(ctx context.Context, msg IngestMessage) error {
 	p.logger.Info("pipeline started",
 		slog.String("index_run_id", msg.IndexRunID.String()),
-		slog.String("source_type", msg.SourceType))
+		slog.String("source_type", msg.SourceType),
+		slog.String("trigger", msg.Trigger))
 
-	// Mark as running
-	if err := p.store.UpdateIndexRunStatus(ctx, postgres.UpdateIndexRunStatusParams{
-		ID:     msg.IndexRunID,
-		Status: "running",
-	}); err != nil {
-		return fmt.Errorf("update status to running: %w", err)
+	isParseComplete := msg.Trigger == "parse_complete"
+
+	// On initial trigger: mark as running. On parse_complete: status is already running.
+	if !isParseComplete {
+		if err := p.store.UpdateIndexRunStatus(ctx, postgres.UpdateIndexRunStatusParams{
+			ID:     msg.IndexRunID,
+			Status: "running",
+		}); err != nil {
+			return fmt.Errorf("update status to running: %w", err)
+		}
 	}
 
 	rc := &IndexRunContext{
@@ -43,18 +59,27 @@ func (p *Pipeline) Run(ctx context.Context, msg IngestMessage) error {
 		Trigger:    msg.Trigger,
 	}
 
-	// Load project settings for optional lineage_exclude_paths
+	// Load project settings.
 	if proj, err := p.store.GetProjectByID(ctx, msg.ProjectID); err == nil && len(proj.Settings) > 0 {
 		var settings struct {
 			LineageExcludePaths []string `json:"lineage_exclude_paths"`
 		}
-		if json.Unmarshal(proj.Settings, &settings) == nil && len(settings.LineageExcludePaths) > 0 {
+		if json.Unmarshal(proj.Settings, &settings) == nil {
 			rc.LineageExcludePaths = settings.LineageExcludePaths
 		}
 	}
 
 	for _, stage := range p.stages {
-		p.logger.Info("stage started", slog.String("stage", stage.Name()),
+		// Phase routing: skip pre-parse stages when resuming after parse_complete.
+		if isParseComplete && isPreParseStage(stage.Name()) {
+			p.logger.Info("stage skipped (parse_complete phase)",
+				slog.String("stage", stage.Name()),
+				slog.String("index_run_id", msg.IndexRunID.String()))
+			continue
+		}
+
+		p.logger.Info("stage started",
+			slog.String("stage", stage.Name()),
 			slog.String("index_run_id", msg.IndexRunID.String()))
 
 		if err := stage.Execute(ctx, rc); err != nil {
@@ -67,11 +92,21 @@ func (p *Pipeline) Run(ctx context.Context, msg IngestMessage) error {
 			return fmt.Errorf("stage %s failed: %w", stage.Name(), err)
 		}
 
-		p.logger.Info("stage completed", slog.String("stage", stage.Name()),
+		p.logger.Info("stage completed",
+			slog.String("stage", stage.Name()),
 			slog.String("index_run_id", msg.IndexRunID.String()))
+
+		// After the parse stage in phase 1, chunks have been enqueued. Halt here;
+		// the pipeline will resume when parse_complete is received.
+		if !isParseComplete && stage.Name() == "parse" && rc.TotalChunks > 0 {
+			p.logger.Info("parse chunks enqueued, awaiting completion",
+				slog.String("index_run_id", msg.IndexRunID.String()),
+				slog.Int("total_chunks", rc.TotalChunks))
+			return nil
+		}
 	}
 
-	// Save commit SHA for incremental indexing on next run
+	// Save commit SHA for incremental indexing on next run.
 	if rc.CurrentSHA != "" {
 		_ = p.store.UpdateSourceLastCommitSHA(ctx, postgres.UpdateSourceLastCommitSHAParams{
 			ID:            rc.SourceID,
@@ -79,7 +114,7 @@ func (p *Pipeline) Run(ctx context.Context, msg IngestMessage) error {
 		})
 	}
 
-	// Update stats and mark complete
+	// Update stats and mark complete.
 	_ = p.store.UpdateIndexRunStats(ctx, postgres.UpdateIndexRunStatsParams{
 		ID:             msg.IndexRunID,
 		FilesProcessed: int32(rc.FilesProcessed),
@@ -103,6 +138,12 @@ func (p *Pipeline) Run(ctx context.Context, msg IngestMessage) error {
 	return nil
 }
 
+// isPreParseStage returns true for stages that should only run in phase 1
+// (the initial clone + parse pass) and must be skipped on parse_complete.
+func isPreParseStage(name string) bool {
+	return name == "clone" || name == "parse"
+}
+
 // NoOpStage is a placeholder stage that just logs.
 type NoOpStage struct {
 	name string
@@ -117,4 +158,3 @@ func (s *NoOpStage) Name() string { return s.name }
 func (s *NoOpStage) Execute(_ context.Context, _ *IndexRunContext) error {
 	return nil
 }
-

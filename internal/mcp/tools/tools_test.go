@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"testing"
 
 	"github.com/maraichr/lattice/internal/mcp"
@@ -141,6 +142,47 @@ func contains(s, substr string) bool {
 	return false
 }
 
+// --- classifyIntent: cross-language ---
+
+func TestClassifyIntent_CrossLanguage(t *testing.T) {
+	tests := []string{
+		"what tables does this endpoint touch?",
+		"full stack trace of getUserById",
+		"who calls this stored procedure?",
+		"end to end from frontend to database",
+	}
+	for _, q := range tests {
+		if classifyIntent(q) != IntentCrossLanguage {
+			t.Errorf("expected IntentCrossLanguage for %q, got %s", q, classifyIntent(q))
+		}
+	}
+}
+
+func TestClassifyIntent_Ranking(t *testing.T) {
+	tests := []string{
+		"most used tables",
+		"top 10 functions",
+		"busiest endpoints",
+	}
+	for _, q := range tests {
+		if classifyIntent(q) != IntentRanking {
+			t.Errorf("expected IntentRanking for %q, got %s", q, classifyIntent(q))
+		}
+	}
+}
+
+func TestClassifyIntent_Bridges(t *testing.T) {
+	tests := []string{
+		"show me cross-language bridges",
+		"what bridges exist between languages?",
+	}
+	for _, q := range tests {
+		if classifyIntent(q) != IntentBridges {
+			t.Errorf("expected IntentBridges for %q, got %s", q, classifyIntent(q))
+		}
+	}
+}
+
 // --- isLowValue ---
 
 func TestIsLowValue_LowPageRankColumn(t *testing.T) {
@@ -198,5 +240,68 @@ func TestIdentifyCore(t *testing.T) {
 	}
 	if core[[16]byte{3}] {
 		t.Error("non-seed symbols should not be core")
+	}
+}
+
+// --- agentToolCatalog ---
+
+func TestAgentToolCatalog_HasExpectedTools(t *testing.T) {
+	catalog := agentToolCatalog()
+
+	expected := map[string]bool{
+		"search_symbols":        false,
+		"get_lineage":           false,
+		"analyze_impact":        false,
+		"extract_subgraph":      false,
+		"trace_cross_language":  false,
+		"get_project_analytics": false,
+		"semantic_search":       false,
+	}
+
+	for _, tool := range catalog {
+		if tool.Type != "function" {
+			t.Errorf("tool %s has type %q, want 'function'", tool.Function.Name, tool.Type)
+		}
+		if _, ok := expected[tool.Function.Name]; ok {
+			expected[tool.Function.Name] = true
+		} else {
+			t.Errorf("unexpected tool in catalog: %s", tool.Function.Name)
+		}
+	}
+
+	for name, found := range expected {
+		if !found {
+			t.Errorf("expected tool %s not in catalog", name)
+		}
+	}
+}
+
+func TestAgentToolCatalog_ExcludesAskCodebase(t *testing.T) {
+	catalog := agentToolCatalog()
+	for _, tool := range catalog {
+		if tool.Function.Name == "ask_codebase" {
+			t.Error("ask_codebase should not be in agent tool catalog (would cause recursion)")
+		}
+		if tool.Function.Name == "list_projects" {
+			t.Error("list_projects should not be in agent tool catalog")
+		}
+	}
+}
+
+// --- dispatchToolCall ---
+
+func TestDispatchToolCall_UnknownTool(t *testing.T) {
+	h := &AskCodebaseHandler{}
+	result := h.dispatchToolCall(context.TODO(), "nonexistent_tool", `{}`, "test-project")
+	if !contains(result, "Unknown tool") {
+		t.Errorf("expected 'Unknown tool' error, got %q", result)
+	}
+}
+
+func TestDispatchToolCall_InvalidJSON(t *testing.T) {
+	h := &AskCodebaseHandler{}
+	result := h.dispatchToolCall(context.TODO(), "search_symbols", `{invalid`, "test-project")
+	if !contains(result, "Error parsing") {
+		t.Errorf("expected parsing error, got %q", result)
 	}
 }

@@ -4,19 +4,24 @@ package parser
 type SQLRouter struct {
 	tsql  Parser
 	pgsql Parser
+	mysql Parser
 }
 
-func NewSQLRouter(tsql, pgsql Parser) *SQLRouter {
-	return &SQLRouter{tsql: tsql, pgsql: pgsql}
+func NewSQLRouter(tsql, pgsql, mysql Parser) *SQLRouter {
+	return &SQLRouter{tsql: tsql, pgsql: pgsql, mysql: mysql}
 }
 
 func (r *SQLRouter) Parse(input FileInput) (*ParseResult, error) {
-	if input.Language == "tsql" {
+	switch input.Language {
+	case "mysql":
+		return r.mysql.Parse(input)
+	case "pgsql":
+		return r.pgsql.Parse(input)
+	default:
 		return r.tsql.Parse(input)
 	}
-	return r.pgsql.Parse(input)
 }
 
 func (r *SQLRouter) Languages() []string {
-	return []string{"tsql", "pgsql", "sql"}
+	return []string{"tsql", "pgsql", "mysql", "sql"}
 }

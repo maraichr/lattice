@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/maraichr/lattice/internal/config"
 )
 
@@ -20,6 +22,7 @@ const (
 	openRouterMaxRetries     = 3
 	openRouterRetryDelay     = 2 * time.Second
 	openRouterBatchSize      = 100 // avoid huge responses that get truncated or time out
+	openRouterConcurrency    = 10  // max simultaneous in-flight API requests
 )
 
 // OpenRouterClient implements Embedder using the OpenAI-compatible OpenRouter API.
@@ -93,59 +96,88 @@ type openAIEmbedResponse struct {
 }
 
 // EmbedBatch generates embeddings for a batch of texts via OpenRouter.
-// Splits into sub-batches of openRouterBatchSize to avoid huge responses that get truncated or time out.
+//
+// Texts are split into sub-batches of openRouterBatchSize and up to
+// openRouterConcurrency requests are sent in parallel using errgroup. Each
+// chunk writes into a pre-allocated slot in the result slice, so no
+// synchronisation beyond errgroup is required.
 func (c *OpenRouterClient) EmbedBatch(ctx context.Context, texts []string, inputType string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
 	}
 
-	var allEmbeddings [][]float32
+	// Compute chunks upfront so we can pre-allocate the results slice.
+	type chunk struct {
+		start int
+		end   int
+	}
+	var chunks []chunk
 	for i := 0; i < len(texts); i += openRouterBatchSize {
-		end := min(i+openRouterBatchSize, len(texts))
-		batch := texts[i:end]
+		chunks = append(chunks, chunk{i, min(i+openRouterBatchSize, len(texts))})
+	}
 
-		payload := openAIEmbedRequest{
-			Model:          c.model,
-			Input:          batch,
-			EncodingFormat: "float",
-			Provider:       &openRouterProvider{AllowFallbacks: true},
-		}
-		if strings.HasPrefix(c.model, "openai/") || strings.HasPrefix(c.model, "qwen/") {
-			payload.Dimensions = c.dimensions
-		}
-		reqBody, err := json.Marshal(payload)
-		if err != nil {
-			return nil, fmt.Errorf("marshal request: %w", err)
-		}
+	// Pre-allocate one slot per chunk; each goroutine owns its own slot.
+	chunkResults := make([][][]float32, len(chunks))
 
-		var lastErr error
-		for attempt := 0; attempt < openRouterMaxRetries; attempt++ {
-			if attempt > 0 {
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(openRouterRetryDelay * time.Duration(attempt)):
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.SetLimit(openRouterConcurrency)
+
+	for idx, ch := range chunks {
+		idx, ch := idx, ch // capture loop vars
+		eg.Go(func() error {
+			batch := texts[ch.start:ch.end]
+
+			payload := openAIEmbedRequest{
+				Model:          c.model,
+				Input:          batch,
+				EncodingFormat: "float",
+				Provider:       &openRouterProvider{AllowFallbacks: true},
+			}
+			if strings.HasPrefix(c.model, "openai/") || strings.HasPrefix(c.model, "qwen/") {
+				payload.Dimensions = c.dimensions
+			}
+			reqBody, err := json.Marshal(payload)
+			if err != nil {
+				return fmt.Errorf("marshal request (chunk %d): %w", idx, err)
+			}
+
+			var lastErr error
+			for attempt := 0; attempt < openRouterMaxRetries; attempt++ {
+				if attempt > 0 {
+					select {
+					case <-egCtx.Done():
+						return egCtx.Err()
+					case <-time.After(openRouterRetryDelay * time.Duration(attempt)):
+					}
+				}
+
+				embeddings, err := c.doEmbedRequest(egCtx, reqBody)
+				if err == nil {
+					chunkResults[idx] = embeddings
+					return nil
+				}
+				lastErr = err
+				errStr := err.Error()
+				if !strings.Contains(errStr, "No successful provider responses") &&
+					!strings.Contains(errStr, "status 529") &&
+					!strings.Contains(errStr, "Provider Overloaded") &&
+					!strings.Contains(errStr, "empty response") &&
+					!strings.Contains(errStr, "unexpected end of JSON") {
+					return err
 				}
 			}
+			return fmt.Errorf("chunk %d exhausted retries: %w", idx, lastErr)
+		})
+	}
 
-			embeddings, err := c.doEmbedRequest(ctx, reqBody)
-			if err == nil {
-				allEmbeddings = append(allEmbeddings, embeddings...)
-				break
-			}
-			lastErr = err
-			errStr := err.Error()
-			if !strings.Contains(errStr, "No successful provider responses") &&
-				!strings.Contains(errStr, "status 529") &&
-				!strings.Contains(errStr, "Provider Overloaded") &&
-				!strings.Contains(errStr, "empty response") &&
-				!strings.Contains(errStr, "unexpected end of JSON") {
-				return nil, err
-			}
-		}
-		if len(allEmbeddings) < end {
-			return nil, fmt.Errorf("batch %d: %w", i/openRouterBatchSize, lastErr)
-		}
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Flatten chunk results (order is guaranteed by pre-allocated slots).
+	allEmbeddings := make([][]float32, 0, len(texts))
+	for _, r := range chunkResults {
+		allEmbeddings = append(allEmbeddings, r...)
 	}
 	return allEmbeddings, nil
 }

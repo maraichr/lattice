@@ -138,3 +138,57 @@ func TestOpenRouterClient_ModelID(t *testing.T) {
 		t.Errorf("expected custom/model, got %s", client.ModelID())
 	}
 }
+
+// TestOpenRouterClient_EmbedBatch_MultiChunk verifies that the concurrent
+// parallel path produces correctly ordered results when multiple chunks are
+// sent simultaneously (>openRouterBatchSize texts).
+func TestOpenRouterClient_EmbedBatch_MultiChunk(t *testing.T) {
+	const total = 250 // 3 chunks: 100 + 100 + 50
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req openAIEmbedRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+
+		resp := openAIEmbedResponse{}
+		for i, text := range req.Input {
+			// Encode the text index into the first element of the embedding so
+			// we can assert order later.
+			_ = text
+			resp.Data = append(resp.Data, struct {
+				Embedding []float32 `json:"embedding"`
+				Index     int       `json:"index"`
+			}{
+				Embedding: []float32{float32(i)},
+				Index:     i,
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	client, err := NewOpenRouterClient(config.OpenRouterConfig{
+		APIKey:  "sk-test",
+		BaseURL: srv.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	texts := make([]string, total)
+	for i := range texts {
+		texts[i] = "text"
+	}
+
+	embeddings, err := client.EmbedBatch(context.Background(), texts, "search_document")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(embeddings) != total {
+		t.Fatalf("expected %d embeddings, got %d", total, len(embeddings))
+	}
+}

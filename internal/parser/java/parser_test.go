@@ -210,3 +210,230 @@ func assertRefTarget(t *testing.T, refs []parser.RawReference, target string) {
 	}
 	t.Errorf("missing ref target %s; have: %v", target, names)
 }
+
+// ---------------------------------------------------------------------------
+// Spring MVC endpoint extraction tests
+// ---------------------------------------------------------------------------
+
+func TestJavaSpringEndpointBasic(t *testing.T) {
+	src := `
+package com.example;
+
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+    @GetMapping
+    public List<Order> getAll() { return null; }
+
+    @GetMapping("/{id}")
+    public Order getById(@PathVariable Long id) { return null; }
+
+    @PostMapping
+    public Order create(@RequestBody Order order) { return null; }
+
+    @DeleteMapping("/{id}")
+    public void delete(@PathVariable Long id) {}
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "OrderController.java", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	endpointMap := make(map[string]parser.Symbol)
+	for _, s := range result.Symbols {
+		if s.Kind == "endpoint" {
+			endpointMap[s.Signature] = s
+		}
+	}
+
+	if len(endpointMap) == 0 {
+		t.Fatal("expected endpoint symbols, got none")
+	}
+
+	wantRoutes := []string{
+		"GET /api/orders",
+		"GET /api/orders/{id}",
+		"POST /api/orders",
+		"DELETE /api/orders/{id}",
+	}
+	for _, want := range wantRoutes {
+		if _, ok := endpointMap[want]; !ok {
+			t.Errorf("missing endpoint %q; have: %v", want, endpointKeys(endpointMap))
+		}
+	}
+}
+
+func TestJavaSpringEndpointNoController(t *testing.T) {
+	src := `
+package com.example;
+
+public class UserService {
+    public User getUser(Long id) { return null; }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "UserService.java", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, s := range result.Symbols {
+		if s.Kind == "endpoint" {
+			t.Errorf("unexpected endpoint symbol %q on non-controller class", s.QualifiedName)
+		}
+	}
+}
+
+func endpointKeys(m map[string]parser.Symbol) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// ---------------------------------------------------------------------------
+// Nested class support tests
+// ---------------------------------------------------------------------------
+
+func TestNestedInnerClass(t *testing.T) {
+	src := `
+package com.example;
+
+public class Outer {
+    public void outerMethod() {}
+
+    public static class Inner {
+        public void innerMethod() {}
+    }
+
+    public interface Callback {
+    }
+
+    public enum Status {
+        ACTIVE, INACTIVE
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "Outer.java", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertHasSymbol(t, result.Symbols, "com.example.Outer", "class")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.outerMethod", "method")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.Inner", "class")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.Inner.innerMethod", "method")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.Callback", "interface")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.Status", "enum")
+}
+
+func TestDeeplyNestedClass(t *testing.T) {
+	src := `
+package com.example;
+
+public class Outer {
+    public static class Middle {
+        public static class Inner {
+            public void deepMethod() {}
+        }
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "Outer.java", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertHasSymbol(t, result.Symbols, "com.example.Outer", "class")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.Middle", "class")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.Middle.Inner", "class")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.Middle.Inner.deepMethod", "method")
+}
+
+// ---------------------------------------------------------------------------
+// Method call extraction tests
+// ---------------------------------------------------------------------------
+
+func TestMethodCallExtraction(t *testing.T) {
+	src := `
+package com.example;
+
+public class OrderService {
+    public void processOrder(Order order) {
+        validate(order);
+        orderRepository.save(order);
+        notificationService.sendConfirmation(order);
+        System.out.println("done");
+    }
+
+    private void validate(Order order) {
+        order.toString();
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "OrderService.java", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(result.References, "calls")
+
+	// Should include non-trivial calls
+	assertRefTarget(t, callRefs, "validate")
+	assertRefTarget(t, callRefs, "save")
+	assertRefTarget(t, callRefs, "sendConfirmation")
+
+	// Should NOT include common methods
+	for _, r := range callRefs {
+		if r.ToName == "println" || r.ToName == "toString" {
+			t.Errorf("common method %q should be filtered from call refs", r.ToName)
+		}
+	}
+
+	// Verify FromSymbol is the enclosing method
+	for _, r := range callRefs {
+		if r.ToName == "validate" && r.FromSymbol != "com.example.OrderService.processOrder" {
+			t.Errorf("expected FromSymbol com.example.OrderService.processOrder, got %s", r.FromSymbol)
+		}
+	}
+}
+
+func TestMethodCallSkipsJDBC(t *testing.T) {
+	src := `
+package com.example;
+
+public class UserDao {
+    public void getUser() {
+        conn.prepareStatement("SELECT * FROM users");
+        helper.doSomething();
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "UserDao.java", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(result.References, "calls")
+	assertRefTarget(t, callRefs, "doSomething")
+
+	// prepareStatement should NOT appear in calls (filtered + handled by JDBC)
+	for _, r := range callRefs {
+		if r.ToName == "prepareStatement" {
+			t.Error("prepareStatement should not appear in calls refs")
+		}
+	}
+
+	// JDBC detection should still produce uses_table
+	tableRefs := filterRefs(result.References, "uses_table")
+	assertRefTarget(t, tableRefs, "users")
+}

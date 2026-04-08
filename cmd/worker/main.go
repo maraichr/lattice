@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/maraichr/lattice/internal/analytics"
@@ -16,11 +17,13 @@ import (
 	"github.com/maraichr/lattice/internal/ingestion/connectors"
 	"github.com/maraichr/lattice/internal/lineage"
 	"github.com/maraichr/lattice/internal/parser"
+	csharpp "github.com/maraichr/lattice/internal/parser/csharp"
 	"github.com/maraichr/lattice/internal/parser/asp"
 	"github.com/maraichr/lattice/internal/parser/delphi"
-	csharpp "github.com/maraichr/lattice/internal/parser/csharp"
 	javap "github.com/maraichr/lattice/internal/parser/java"
 	jsts "github.com/maraichr/lattice/internal/parser/javascript"
+	mysqlp "github.com/maraichr/lattice/internal/parser/mysql"
+	phpp "github.com/maraichr/lattice/internal/parser/php"
 	"github.com/maraichr/lattice/internal/parser/pgsql"
 	"github.com/maraichr/lattice/internal/parser/tsql"
 	"github.com/maraichr/lattice/internal/resolver"
@@ -101,7 +104,7 @@ func main() {
 
 	// Parser registry
 	registry := parser.NewRegistry()
-	sqlRouter := parser.NewSQLRouter(tsql.New(), pgsql.New())
+	sqlRouter := parser.NewSQLRouter(tsql.New(), pgsql.New(), mysqlp.New())
 	registry.Register(".sql", sqlRouter)
 	registry.Register(".sqldataprovider", sqlRouter)
 	aspParser := asp.New()
@@ -123,6 +126,9 @@ func main() {
 	tsParser := jsts.NewTS()
 	registry.Register(".ts", tsParser)
 	registry.Register(".tsx", tsParser)
+	phpParser := phpp.New()
+	registry.Register(".php", phpParser)
+	registry.Register(".phtml", phpParser)
 
 	// Embeddings (auto-selects: OpenRouter > Bedrock > disabled)
 	var embedStage ingestion.Stage
@@ -147,11 +153,15 @@ func main() {
 	analyticsEngine := analytics.NewEngine(s, logger)
 
 	// Pipeline stages
+	// ParseStage now only chunks and enqueues files; parse workers do the actual parsing.
 	stages := []ingestion.Stage{
 		ingestion.NewCloneStage(s, zipConn, gitConn, s3Conn),
-		ingestion.NewParseStage(registry, s),
+		ingestion.NewParseStage(s, vkClient),
+		// ResolveStage, Lineage, Graph, Embed, Analytics run after all parse chunks complete.
+		// The orchestrator (pipeline.go) gates these stages on TotalChunks == 0, meaning
+		// the parse_complete resume message drives the post-parse stages.
 		ingestion.NewResolveStage(resolverEngine),
-		ingestion.NewLineageStage(lineageEngine, logger),
+		ingestion.NewLineageStage(lineageEngine, s, logger),
 		ingestion.NewGraphStage(s, graphClient, logger),
 		embedStage,
 		ingestion.NewAnalyticsStage(analyticsEngine, logger),
@@ -159,22 +169,45 @@ func main() {
 
 	pipeline := ingestion.NewPipeline(s, stages, logger)
 
-	// Consumer
+	// Main ingest consumer (orchestrator).
 	consumer := ingestion.NewConsumer(vkClient, "worker-1", logger)
 	if err := consumer.EnsureGroup(ctx); err != nil {
 		logger.Error("failed to ensure consumer group", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 
-	logger.Info("starting worker, consuming from stream", slog.String("stream", ingestion.StreamName))
-
-	if err := consumer.Consume(ctx, pipeline.Run); err != nil {
-		if ctx.Err() != nil {
-			logger.Info("worker stopped by signal")
-		} else {
-			logger.Error("consumer error", slog.String("error", err.Error()))
-		}
+	// Parse task consumer — processes individual file chunks in parallel with the orchestrator.
+	parseWorker := ingestion.NewParseWorker(registry, s, vkClient, logger)
+	parseTaskConsumer := ingestion.NewParseTaskConsumer(vkClient, "parse-worker-1", logger)
+	if err := parseTaskConsumer.EnsureParseGroup(ctx); err != nil {
+		logger.Error("failed to ensure parse task consumer group", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		logger.Info("starting parse worker, consuming from stream", slog.String("stream", ingestion.ParseTaskStream))
+		if err := parseTaskConsumer.Consume(ctx, parseWorker.Handle); err != nil {
+			if ctx.Err() == nil {
+				logger.Error("parse task consumer error", slog.String("error", err.Error()))
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		logger.Info("starting orchestrator worker, consuming from stream", slog.String("stream", ingestion.StreamName))
+		if err := consumer.Consume(ctx, pipeline.Run); err != nil {
+			if ctx.Err() == nil {
+				logger.Error("consumer error", slog.String("error", err.Error()))
+			}
+		}
+	}()
+
+	wg.Wait()
 	logger.Info("worker stopped")
 }

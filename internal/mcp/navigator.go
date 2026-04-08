@@ -65,18 +65,20 @@ func (n *Navigator) SuggestNextSteps(toolName string, symbols []postgres.Symbol,
 	switch toolName {
 	case "search_symbols":
 		hints.Steps = n.hintsAfterSearch(symbols)
-	case "get_symbol_details":
-		hints.Steps = n.hintsAfterDetails(symbols)
-	case "get_dependencies":
-		hints.Steps = n.hintsAfterDependencies(symbols)
-	case "trace_lineage":
+	case "extract_subgraph":
+		hints.Steps = n.hintsAfterSubgraph(symbols)
+	case "get_lineage":
 		hints.Steps = n.hintsAfterLineage(symbols)
 	case "list_project_overview":
 		hints.Steps = n.hintsAfterOverview(symbols)
-	case "find_usages":
-		hints.Steps = n.hintsAfterUsages(symbols)
 	case "analyze_impact":
 		hints.Steps = n.hintsAfterImpact(symbols)
+	case "trace_cross_language":
+		hints.Steps = n.hintsAfterCrossLanguageTrace(symbols)
+	case "semantic_search":
+		hints.Steps = n.hintsAfterSemanticSearch(symbols)
+	case "get_project_analytics":
+		hints.Steps = n.hintsAfterAnalytics(symbols)
 	default:
 		hints.Steps = n.defaultHints(symbols)
 	}
@@ -95,25 +97,25 @@ func (n *Navigator) hintsAfterSearch(symbols []postgres.Symbol) []NavigationStep
 	if len(symbols) > 0 {
 		top := symbols[0]
 		steps = append(steps, NavigationStep{
-			Tool:            "get_symbol_details",
-			Description:     fmt.Sprintf("Deep-dive into %s", top.Name),
-			Params:          map[string]string{"symbol_id": top.ID.String()},
-			EstimatedTokens: estimateDetailTokens(top),
+			Tool:            "search_symbols",
+			Description:     fmt.Sprintf("Refine search for %s with kind/language filters", top.Name),
+			Params:          map[string]string{"query": top.Name},
+			EstimatedTokens: 400,
 		})
 
 		cat := classifyKind(top.Kind)
 		if cat == categoryData {
 			steps = append(steps, NavigationStep{
-				Tool:            "trace_lineage",
+				Tool:            "get_lineage",
 				Description:     fmt.Sprintf("Trace data flow for %s", top.Name),
-				Params:          map[string]string{"symbol_id": top.ID.String(), "direction": "both"},
+				Params:          map[string]string{"symbol_name": top.Name, "direction": "both"},
 				EstimatedTokens: 800,
 			})
 		} else if cat == categoryCode || cat == categoryContainer {
 			steps = append(steps, NavigationStep{
-				Tool:            "get_dependencies",
+				Tool:            "extract_subgraph",
 				Description:     fmt.Sprintf("Show what %s depends on / is depended by", top.Name),
-				Params:          map[string]string{"symbol_id": top.ID.String()},
+				Params:          map[string]string{"topic": top.Name},
 				EstimatedTokens: 600,
 			})
 		}
@@ -130,7 +132,7 @@ func (n *Navigator) hintsAfterSearch(symbols []postgres.Symbol) []NavigationStep
 	return steps
 }
 
-func (n *Navigator) hintsAfterDetails(symbols []postgres.Symbol) []NavigationStep {
+func (n *Navigator) hintsAfterSubgraph(symbols []postgres.Symbol) []NavigationStep {
 	if len(symbols) == 0 {
 		return nil
 	}
@@ -138,61 +140,34 @@ func (n *Navigator) hintsAfterDetails(symbols []postgres.Symbol) []NavigationSte
 	sym := symbols[0]
 	steps := []NavigationStep{
 		{
-			Tool:            "get_dependencies",
-			Description:     fmt.Sprintf("Explore dependencies of %s", sym.Name),
-			Params:          map[string]string{"symbol_id": sym.ID.String()},
+			Tool:            "extract_subgraph",
+			Description:     fmt.Sprintf("Explore deeper around %s", sym.Name),
+			Params:          map[string]string{"topic": sym.Name},
 			EstimatedTokens: 600,
 		},
 		{
-			Tool:            "find_usages",
-			Description:     fmt.Sprintf("Find all references to %s", sym.Name),
-			Params:          map[string]string{"symbol_id": sym.ID.String()},
+			Tool:            "analyze_impact",
+			Description:     fmt.Sprintf("Analyze impact of changing %s", sym.Name),
+			Params:          map[string]string{"symbol_name": sym.Name},
 			EstimatedTokens: 400,
 		},
 	}
 
 	if classifyKind(sym.Kind) == categoryData {
 		steps = append(steps, NavigationStep{
-			Tool:            "trace_lineage",
+			Tool:            "get_lineage",
 			Description:     fmt.Sprintf("Trace lineage through %s", sym.Name),
-			Params:          map[string]string{"symbol_id": sym.ID.String()},
+			Params:          map[string]string{"symbol_name": sym.Name},
 			EstimatedTokens: 800,
 		})
 	} else {
 		steps = append(steps, NavigationStep{
 			Tool:            "analyze_impact",
-			Description:     fmt.Sprintf("Analyze impact of changing %s", sym.Name),
-			Params:          map[string]string{"symbol_id": sym.ID.String()},
+			Description:     fmt.Sprintf("Analyze blast radius of %s", sym.Name),
+			Params:          map[string]string{"symbol_name": sym.Name},
 			EstimatedTokens: 1000,
 		})
 	}
-
-	return steps
-}
-
-func (n *Navigator) hintsAfterDependencies(symbols []postgres.Symbol) []NavigationStep {
-	steps := make([]NavigationStep, 0, 3)
-
-	// Find unexplored high-value symbols
-	for _, sym := range symbols {
-		if classifyKind(sym.Kind) == categoryContainer || classifyKind(sym.Kind) == categoryData {
-			steps = append(steps, NavigationStep{
-				Tool:            "get_symbol_details",
-				Description:     fmt.Sprintf("Examine %s (%s)", sym.Name, sym.Kind),
-				Params:          map[string]string{"symbol_id": sym.ID.String()},
-				EstimatedTokens: estimateDetailTokens(sym),
-			})
-			if len(steps) >= 2 {
-				break
-			}
-		}
-	}
-
-	steps = append(steps, NavigationStep{
-		Tool:            "extract_subgraph",
-		Description:     "Extract the full topic subgraph",
-		EstimatedTokens: 1200,
-	})
 
 	return steps
 }
@@ -203,10 +178,10 @@ func (n *Navigator) hintsAfterLineage(symbols []postgres.Symbol) []NavigationSte
 	for _, sym := range symbols {
 		if classifyKind(sym.Kind) == categoryCode {
 			steps = append(steps, NavigationStep{
-				Tool:            "get_symbol_details",
+				Tool:            "search_symbols",
 				Description:     fmt.Sprintf("Examine transformer %s", sym.Name),
-				Params:          map[string]string{"symbol_id": sym.ID.String()},
-				EstimatedTokens: estimateDetailTokens(sym),
+				Params:          map[string]string{"query": sym.Name},
+				EstimatedTokens: 400,
 			})
 			break
 		}
@@ -236,34 +211,16 @@ func (n *Navigator) hintsAfterOverview(_ []postgres.Symbol) []NavigationStep {
 	}
 }
 
-func (n *Navigator) hintsAfterUsages(symbols []postgres.Symbol) []NavigationStep {
-	steps := make([]NavigationStep, 0, 2)
-
-	for _, sym := range symbols {
-		steps = append(steps, NavigationStep{
-			Tool:            "get_symbol_details",
-			Description:     fmt.Sprintf("Examine caller %s", sym.Name),
-			Params:          map[string]string{"symbol_id": sym.ID.String()},
-			EstimatedTokens: estimateDetailTokens(sym),
-		})
-		if len(steps) >= 2 {
-			break
-		}
-	}
-
-	return steps
-}
-
 func (n *Navigator) hintsAfterImpact(symbols []postgres.Symbol) []NavigationStep {
 	steps := make([]NavigationStep, 0, 2)
 
 	for _, sym := range symbols {
 		if classifyKind(sym.Kind) == categoryData || classifyKind(sym.Kind) == categoryContainer {
 			steps = append(steps, NavigationStep{
-				Tool:            "get_symbol_details",
+				Tool:            "search_symbols",
 				Description:     fmt.Sprintf("Examine impacted %s (%s)", sym.Name, sym.Kind),
-				Params:          map[string]string{"symbol_id": sym.ID.String()},
-				EstimatedTokens: estimateDetailTokens(sym),
+				Params:          map[string]string{"query": sym.Name},
+				EstimatedTokens: 400,
 			})
 			if len(steps) >= 2 {
 				break
@@ -274,6 +231,72 @@ func (n *Navigator) hintsAfterImpact(symbols []postgres.Symbol) []NavigationStep
 	return steps
 }
 
+func (n *Navigator) hintsAfterCrossLanguageTrace(symbols []postgres.Symbol) []NavigationStep {
+	steps := make([]NavigationStep, 0, 3)
+
+	for _, sym := range symbols {
+		steps = append(steps, NavigationStep{
+			Tool:            "analyze_impact",
+			Description:     fmt.Sprintf("Analyze blast radius of bridge symbol %s", sym.Name),
+			Params:          map[string]string{"symbol_name": sym.Name},
+			EstimatedTokens: 1000,
+		})
+		if len(steps) >= 1 {
+			break
+		}
+	}
+
+	steps = append(steps, NavigationStep{
+		Tool:            "get_project_analytics",
+		Description:     "Check cross-language bridge coverage",
+		Params:          map[string]string{"scope": "bridges"},
+		EstimatedTokens: 400,
+	})
+
+	return steps
+}
+
+func (n *Navigator) hintsAfterSemanticSearch(symbols []postgres.Symbol) []NavigationStep {
+	steps := make([]NavigationStep, 0, 3)
+
+	for _, sym := range symbols {
+		if classifyKind(sym.Kind) == categoryData {
+			steps = append(steps, NavigationStep{
+				Tool:            "get_lineage",
+				Description:     fmt.Sprintf("Trace lineage for %s", sym.Name),
+				Params:          map[string]string{"symbol_name": sym.Name},
+				EstimatedTokens: 800,
+			})
+			break
+		}
+	}
+
+	if len(symbols) > 0 {
+		steps = append(steps, NavigationStep{
+			Tool:            "extract_subgraph",
+			Description:     "Explore topic subgraph around these results",
+			EstimatedTokens: 1200,
+		})
+	}
+
+	return steps
+}
+
+func (n *Navigator) hintsAfterAnalytics(_ []postgres.Symbol) []NavigationStep {
+	return []NavigationStep{
+		{
+			Tool:            "search_symbols",
+			Description:     "Drill into specific symbol kinds or languages",
+			EstimatedTokens: 400,
+		},
+		{
+			Tool:            "extract_subgraph",
+			Description:     "Explore a specific topic in the codebase",
+			EstimatedTokens: 1200,
+		},
+	}
+}
+
 func (n *Navigator) defaultHints(symbols []postgres.Symbol) []NavigationStep {
 	if len(symbols) == 0 {
 		return nil
@@ -281,10 +304,10 @@ func (n *Navigator) defaultHints(symbols []postgres.Symbol) []NavigationStep {
 	sym := symbols[0]
 	return []NavigationStep{
 		{
-			Tool:            "get_symbol_details",
+			Tool:            "search_symbols",
 			Description:     fmt.Sprintf("Examine %s", sym.Name),
-			Params:          map[string]string{"symbol_id": sym.ID.String()},
-			EstimatedTokens: estimateDetailTokens(sym),
+			Params:          map[string]string{"query": sym.Name},
+			EstimatedTokens: 400,
 		},
 	}
 }

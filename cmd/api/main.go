@@ -115,7 +115,7 @@ func main() {
 	if cfg.Oracle.Enabled && cfg.OpenRouter.APIKey != "" && vkClient != nil {
 		llmClient := llm.NewClient(cfg.OpenRouter.APIKey, cfg.Oracle.Model, cfg.OpenRouter.BaseURL)
 		sessionMgr := session.NewManager(vkClient)
-		deps.Oracle = oracle.NewEngine(s, sessionMgr, llmClient, graphClient, deps.Impact, logger)
+		deps.Oracle = oracle.NewEngine(s, sessionMgr, llmClient, deps.Embed, logger)
 		logger.Info("oracle enabled", slog.String("model", cfg.Oracle.Model))
 	}
 

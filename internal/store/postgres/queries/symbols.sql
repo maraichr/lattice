@@ -84,3 +84,6 @@ WHERE project_id = (SELECT id FROM projects WHERE slug = @project_slug)
   AND (cardinality(@languages::text[]) = 0 OR language = ANY(@languages::text[]))
 ORDER BY (COALESCE(metadata->>'in_degree', '0'))::int DESC
 LIMIT @lim;
+
+-- ListSymbolsByQualifiedNames is in symbols_ext.go (hand-written for proper type handling)
+-- GetSymbolsByProjectPaged is in symbols_ext.go (hand-written, returns SymbolSummary)

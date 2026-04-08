@@ -1,6 +1,7 @@
 package javascript
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/maraichr/lattice/internal/parser"
@@ -515,6 +516,133 @@ const result = await fetch("/api/users");
 	tableRefs := filterRefs(result.References, "uses_table")
 	if len(tableRefs) != 0 {
 		t.Errorf("expected no table refs from fetch call, got %d", len(tableRefs))
+	}
+}
+
+func TestJSAPICallFetch(t *testing.T) {
+	src := `
+async function loadUsers() {
+  const res = await fetch("/api/users");
+  return res.json();
+}
+`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "client.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiRefs := filterRefs(result.References, "calls_api")
+	if len(apiRefs) == 0 {
+		t.Fatal("expected at least one calls_api ref from fetch")
+	}
+	assertRefTarget(t, apiRefs, "/api/users")
+}
+
+func TestJSAPICallAxiosGet(t *testing.T) {
+	src := `
+async function getOrder(id) {
+  return axios.get("/api/orders/" + id);
+}
+`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "client.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiRefs := filterRefs(result.References, "calls_api")
+	if len(apiRefs) == 0 {
+		t.Fatal("expected at least one calls_api ref from axios.get")
+	}
+	found := false
+	for _, r := range apiRefs {
+		if strings.Contains(r.ToName, "/api/orders") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected calls_api ref containing /api/orders, got %v", apiRefs)
+	}
+}
+
+func TestJSAPICallTemplateString(t *testing.T) {
+	src := "async function fetchUser(id) { return fetch(`/api/users/${id}`); }"
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "client.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiRefs := filterRefs(result.References, "calls_api")
+	if len(apiRefs) == 0 {
+		t.Fatal("expected calls_api ref from template string fetch")
+	}
+	// Template ${id} should be normalised to {*}
+	assertRefTarget(t, apiRefs, "/api/users/{*}")
+}
+
+func TestJSAPICallAxiosPost(t *testing.T) {
+	src := `
+function createOrder(data) {
+  return axios.post("/api/orders", data);
+}
+`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "client.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiRefs := filterRefs(result.References, "calls_api")
+	found := false
+	for _, r := range apiRefs {
+		if strings.Contains(r.ToName, "POST") && strings.Contains(r.ToName, "/api/orders") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected POST /api/orders ref, got %v", apiRefs)
+	}
+}
+
+func TestJSAPICallJQueryAjax(t *testing.T) {
+	src := `
+function loadUsers() {
+	$.ajax({
+		url: "/api/users",
+		method: "GET",
+		success: function() {}
+	});
+}
+`
+	p := NewJS()
+	res, _ := p.Parse(parser.FileInput{Path: "test.js", Content: []byte(src)})
+	refs := filterRefs(res.References, "calls_api")
+	if len(refs) != 1 {
+		t.Fatalf("expected 1 calls_api, got %d", len(refs))
+	}
+	if refs[0].ToName != "GET /api/users" {
+		t.Errorf("expected GET /api/users, got %s", refs[0].ToName)
+	}
+}
+
+func TestJSAPICallDNNServiceFramework(t *testing.T) {
+	src := `
+function loadUsers() {
+	var sf = $.ServicesFramework(123);
+	$.ajax({
+		url: sf.getServiceRoot('module') + 'users/list',
+		method: "GET",
+		success: function() {}
+	});
+}
+`
+	p := NewJS()
+	res, _ := p.Parse(parser.FileInput{Path: "test.js", Content: []byte(src)})
+	refs := filterRefs(res.References, "calls_api")
+	if len(refs) != 1 {
+		t.Fatalf("expected 1 calls_api, got %d", len(refs))
+	}
+	if refs[0].ToName != "GET users/list{*}" {
+		t.Errorf("expected GET users/list{*}, got %s", refs[0].ToName)
 	}
 }
 

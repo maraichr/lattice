@@ -7,11 +7,15 @@ import (
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/maraichr/lattice/internal/config"
 )
 
-const maxBatchSize = 96 // Cohere embed API limit
+const (
+	maxBatchSize      = 96 // Cohere embed API limit
+	bedrockConcurrency = 8  // max simultaneous in-flight Bedrock requests
+)
 
 // Client wraps the AWS Bedrock runtime for embedding generation.
 type Client struct {
@@ -43,26 +47,51 @@ type cohereEmbedResponse struct {
 	Embeddings [][]float32 `json:"embeddings"`
 }
 
-// EmbedBatch generates embeddings for a batch of texts.
-// Automatically splits into sub-batches of maxBatchSize.
+// EmbedBatch generates embeddings for a batch of texts via AWS Bedrock.
+//
+// Texts are split into sub-batches of maxBatchSize and up to bedrockConcurrency
+// requests are sent in parallel using errgroup. Each chunk writes into a
+// pre-allocated slot in the result slice.
 func (c *Client) EmbedBatch(ctx context.Context, texts []string, inputType string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
 	}
 
-	var allEmbeddings [][]float32
-
+	type chunk struct {
+		start int
+		end   int
+	}
+	var chunks []chunk
 	for i := 0; i < len(texts); i += maxBatchSize {
-		end := min(i+maxBatchSize, len(texts))
-		batch := texts[i:end]
-
-		embeddings, err := c.embedSingle(ctx, batch, inputType)
-		if err != nil {
-			return nil, fmt.Errorf("embed batch %d: %w", i/maxBatchSize, err)
-		}
-		allEmbeddings = append(allEmbeddings, embeddings...)
+		chunks = append(chunks, chunk{i, min(i+maxBatchSize, len(texts))})
 	}
 
+	// Pre-allocate one slot per chunk; each goroutine owns its own slot.
+	chunkResults := make([][][]float32, len(chunks))
+
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.SetLimit(bedrockConcurrency)
+
+	for idx, ch := range chunks {
+		idx, ch := idx, ch // capture loop vars
+		eg.Go(func() error {
+			embeddings, err := c.embedSingle(egCtx, texts[ch.start:ch.end], inputType)
+			if err != nil {
+				return fmt.Errorf("chunk %d: %w", idx, err)
+			}
+			chunkResults[idx] = embeddings
+			return nil
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+
+	allEmbeddings := make([][]float32, 0, len(texts))
+	for _, r := range chunkResults {
+		allEmbeddings = append(allEmbeddings, r...)
+	}
 	return allEmbeddings, nil
 }
 

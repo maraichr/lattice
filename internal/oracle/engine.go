@@ -5,15 +5,17 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/google/uuid"
-
-	"github.com/maraichr/lattice/internal/graph"
-	"github.com/maraichr/lattice/internal/impact"
+	"github.com/maraichr/lattice/internal/embedding"
 	"github.com/maraichr/lattice/internal/llm"
 	"github.com/maraichr/lattice/internal/mcp/session"
+	"github.com/maraichr/lattice/internal/mcp/tools"
 	"github.com/maraichr/lattice/internal/store"
 	"github.com/maraichr/lattice/internal/store/postgres"
 )
+
+// NOTE: LLM-based intent routing now lives in tools.AskCodebaseHandler.
+// The Oracle engine is a thin wrapper that adds session management and
+// structured block responses on top of ask_codebase.
 
 // Request is the input to the Oracle engine.
 type Request struct {
@@ -22,24 +24,20 @@ type Request struct {
 	Verbosity string `json:"verbosity,omitempty"`
 }
 
-// Engine is the Oracle core: routes questions via LLM and executes tool chains.
+// Engine is the Oracle core: delegates to ask_codebase MCP handler with session management.
 type Engine struct {
 	store   *store.Store
 	session *session.Manager
-	llm     *llm.Client
-	graph   *graph.Client
-	impact  *impact.Engine
+	ask     *tools.AskCodebaseHandler
 	logger  *slog.Logger
 }
 
 // NewEngine creates a new Oracle engine.
-func NewEngine(s *store.Store, sm *session.Manager, llmClient *llm.Client, graphClient *graph.Client, impactEngine *impact.Engine, logger *slog.Logger) *Engine {
+func NewEngine(s *store.Store, sm *session.Manager, llmClient *llm.Client, embedder embedding.Embedder, logger *slog.Logger) *Engine {
 	return &Engine{
 		store:   s,
 		session: sm,
-		llm:     llmClient,
-		graph:   graphClient,
-		impact:  impactEngine,
+		ask:     tools.NewAskCodebaseHandler(s, sm, embedder, llmClient, logger),
 		logger:  logger,
 	}
 }
@@ -50,6 +48,7 @@ func (e *Engine) Store() *store.Store {
 }
 
 // Ask processes a user question for a given project.
+// Routing is handled by ask_codebase (LLM when available, keyword fallback).
 func (e *Engine) Ask(ctx context.Context, project postgres.Project, req Request) (*Response, error) {
 	// 1. Load/create session
 	sess, err := e.session.Load(ctx, req.SessionID)
@@ -58,141 +57,86 @@ func (e *Engine) Ask(ctx context.Context, project postgres.Project, req Request)
 		sess, _ = e.session.Load(ctx, "")
 	}
 
-	// 2. Route intent via LLM (with fallback)
-	var sel *ToolSelection
-	sel, err = routeIntent(ctx, e.llm, req.Question, sess.RecapText())
-	if err != nil {
-		e.logger.Warn("LLM routing failed, using fallback", slog.String("error", err.Error()))
-		sel = fallbackRoute(req.Question)
-	}
-
-	e.logger.Info("oracle routed",
+	e.logger.Info("oracle query",
 		slog.String("question", req.Question),
-		slog.String("tool", sel.Tool),
 		slog.String("session", sess.ID))
 
-	// 3. Execute tool
-	var blocks []Block
-	var items []SymbolItem
-	var execErr error
-
-	switch sel.Tool {
-	case "search":
-		blocks, items, execErr = executeSearch(ctx, e.store, project.Slug, sel.Params)
-	case "ranking":
-		blocks, items, execErr = executeRanking(ctx, e.store, project.Slug, sel.Params)
-	case "overview":
-		blocks, execErr = executeOverview(ctx, e.store, project.ID, project.Name)
-	case "subgraph":
-		blocks, items, execErr = executeSubgraph(ctx, e.store, project.Slug, sel.Params)
-	case "relationships":
-		blocks, items, execErr = executeRelationships(ctx, e.store, project.Slug, sel.Params)
-	case "lineage":
-		blocks, items, execErr = executeLineage(ctx, e.store, e.graph, project.Slug, sel.Params)
-	case "impact":
-		blocks, items, execErr = executeImpact(ctx, e.store, e.impact, project.Slug, sel.Params)
-	default:
-		blocks, items, execErr = executeSearch(ctx, e.store, project.Slug, sel.Params)
+	// 2. Delegate to ask_codebase (handles LLM routing + keyword fallback internally)
+	markdown, err := e.ask.Handle(ctx, tools.AskCodebaseParams{
+		Project:   project.Slug,
+		Question:  req.Question,
+		SessionID: sess.ID,
+		Verbosity: req.Verbosity,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("ask_codebase: %w", err)
 	}
 
-	if execErr != nil {
-		return nil, fmt.Errorf("execute %s: %w", sel.Tool, execErr)
+	// 3. Build Oracle response
+	blocks := []Block{
+		textBlock(markdown),
 	}
+	hints := generateHints("ask_codebase")
 
-	// 4. Generate hints
-	hints := generateHints(sel.Tool, items)
-
-	// 5. Update session
+	// 4. Update session
 	sess.AddQuery(req.Question)
-	sess.AddRecap(fmt.Sprintf("Asked about: %s (tool: %s, %d results)", req.Question, sel.Tool, len(items)))
-	for _, item := range items {
-		sess.MarkSeen(uuidFromString(item.ID))
-	}
+	sess.AddRecap(fmt.Sprintf("Asked about: %s", req.Question))
 	if err := e.session.Save(ctx, sess); err != nil {
 		e.logger.Warn("failed to save session", slog.String("error", err.Error()))
 	}
 
-	// 6. Build response
-	totalResults := len(items)
-	if totalResults == 0 {
-		totalResults = 1 // at least the text block counts
-	}
-
 	return &Response{
 		SessionID: sess.ID,
-		Tool:      sel.Tool,
+		Tool:      "ask_codebase",
 		Blocks:    blocks,
 		Hints:     hints,
 		Meta: ResponseMeta{
-			ToolSelected: sel.Tool,
-			TotalResults: totalResults,
-			Shown:        len(items),
+			ToolSelected: "ask_codebase",
+			TotalResults: 1,
+			Shown:        1,
 		},
 	}, nil
 }
 
 // generateHints produces follow-up question suggestions based on the tool used.
-func generateHints(tool string, items []SymbolItem) []Hint {
-	var hints []Hint
-
+func generateHints(tool string) []Hint {
 	switch tool {
 	case "search":
-		if len(items) > 0 {
-			first := items[0]
-			hints = append(hints,
-				Hint{Label: "Impact", Question: fmt.Sprintf("What happens if I change %s?", first.Name)},
-				Hint{Label: "Lineage", Question: fmt.Sprintf("Show data flow for %s", first.Name)},
-				Hint{Label: "Related", Question: fmt.Sprintf("Show everything related to %s", first.Name)},
-			)
+		return []Hint{
+			{Label: "Impact", Question: "What happens if I change this symbol?"},
+			{Label: "Lineage", Question: "Show data flow for this symbol"},
+			{Label: "Related", Question: "Show everything related to this symbol"},
 		}
 	case "ranking":
-		hints = append(hints,
-			Hint{Label: "Overview", Question: "Give me a project overview"},
-			Hint{Label: "Relationships", Question: "Show table relationships"},
-		)
-		if len(items) > 0 {
-			hints = append(hints,
-				Hint{Label: "Deep dive", Question: fmt.Sprintf("Tell me about %s", items[0].Name)},
-			)
+		return []Hint{
+			{Label: "Overview", Question: "Give me a project overview"},
+			{Label: "Relationships", Question: "Show table relationships"},
 		}
-	case "overview":
-		hints = append(hints,
-			Hint{Label: "Top tables", Question: "What are the most important tables?"},
-			Hint{Label: "Architecture", Question: "Show table relationships"},
-			Hint{Label: "Entry points", Question: "What are the most used procedures?"},
-		)
+	case "overview", "ask_codebase":
+		return []Hint{
+			{Label: "Top tables", Question: "What are the most important tables?"},
+			{Label: "Architecture", Question: "Show table relationships"},
+			{Label: "Cross-language", Question: "Trace the full stack from app code to database"},
+		}
 	case "subgraph", "relationships":
-		if len(items) > 0 {
-			hints = append(hints,
-				Hint{Label: "Impact", Question: fmt.Sprintf("What breaks if %s changes?", items[0].Name)},
-			)
+		return []Hint{
+			{Label: "Top symbols", Question: "What are the most connected symbols?"},
 		}
-		hints = append(hints,
-			Hint{Label: "Top symbols", Question: "What are the most connected symbols?"},
-		)
 	case "lineage":
-		if len(items) > 0 {
-			hints = append(hints,
-				Hint{Label: "Impact", Question: fmt.Sprintf("What breaks if %s changes?", items[0].Name)},
-				Hint{Label: "Related", Question: fmt.Sprintf("Show module around %s", items[0].Name)},
-			)
+		return []Hint{
+			{Label: "Impact", Question: "What would break if this changes?"},
 		}
 	case "impact":
-		if len(items) > 0 {
-			hints = append(hints,
-				Hint{Label: "Lineage", Question: fmt.Sprintf("Show data flow for %s", items[0].Name)},
-				Hint{Label: "Related", Question: fmt.Sprintf("Show everything related to %s", items[0].Name)},
-			)
+		return []Hint{
+			{Label: "Lineage", Question: "Show data flow for this symbol"},
 		}
+	case "cross_language":
+		return []Hint{
+			{Label: "Impact", Question: "What would break if this changes?"},
+			{Label: "Overview", Question: "Give me a project overview"},
+		}
+	default:
+		return nil
 	}
-
-	return hints
 }
 
-func uuidFromString(s string) uuid.UUID {
-	id, err := uuid.Parse(s)
-	if err != nil {
-		return uuid.UUID{}
-	}
-	return id
-}

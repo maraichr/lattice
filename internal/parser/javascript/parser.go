@@ -57,6 +57,10 @@ func (p *Parser) Parse(input parser.FileInput) (*parser.ParseResult, error) {
 	dbRefs := p.extractDatabaseRefs(root, input.Content, symbols)
 	refs = append(refs, dbRefs...)
 
+	// Post-extraction pass: detect outbound HTTP API calls (fetch, axios, http, etc.)
+	apiRefs := p.extractAPICallRefs(root, input.Content, symbols)
+	refs = append(refs, apiRefs...)
+
 	return &parser.ParseResult{
 		Symbols:    symbols,
 		References: refs,
@@ -963,9 +967,20 @@ func extractObjectStringProp(args *sitter.Node, src []byte, prop string) string 
 						key = findChild(pair, "identifier")
 					}
 					if key != nil && key.Content(src) == prop {
-						val := findChild(pair, "string")
-						if val != nil {
-							return extractStringContent(val, src)
+						// Look for string, template_string, or binary_expression in the value
+						for k := 0; k < int(pair.ChildCount()); k++ {
+							val := pair.Child(k)
+							if val.Type() == "string" {
+								return extractStringContent(val, src)
+							}
+							if val.Type() == "template_string" {
+								return extractTemplateStringContent(val, src)
+							}
+							if val.Type() == "binary_expression" {
+								if s := extractStringPrefixFromBinaryExpr(val, src); s != "" {
+									return s + "{*}"
+								}
+							}
 						}
 					}
 				}
@@ -1033,4 +1048,277 @@ func extractStringContent(node *sitter.Node, src []byte) string {
 		return strings.Trim(text, `"'`+"`")
 	}
 	return ""
+}
+
+// extractAPICallRefs detects outbound HTTP API calls and emits "calls_api" references.
+//
+// Patterns detected:
+//   - fetch("/api/users")
+//   - fetch(`/api/users/${id}`)
+//   - axios.get("/api/users"), axios.post("/api/orders"), etc.
+//   - axios({ method: "get", url: "/api/users" })
+//   - http.get("/api/users"), https.get("/api/users")
+//   - this.$http.get("/api/users"), this.http.get("/api/users") (Angular/Vue)
+//
+// The URL is normalised before storage: template expressions like `${id}` are
+// replaced with the route-parameter placeholder `{*}` so the cross-language
+// resolver can match them against backend `{id}` or `:id` patterns.
+func (p *Parser) extractAPICallRefs(root *sitter.Node, src []byte, symbols []parser.Symbol) []parser.RawReference {
+	var refs []parser.RawReference
+
+	// Build symbol ranges for FromSymbol resolution (same helper used in extractDatabaseRefs)
+	type symRange struct {
+		qname     string
+		startLine int
+		endLine   int
+	}
+	var ranges []symRange
+	for _, s := range symbols {
+		if s.Kind == "class" || s.Kind == "function" || s.Kind == "method" {
+			ranges = append(ranges, symRange{s.QualifiedName, s.StartLine, s.EndLine})
+		}
+	}
+	findEnclosing := func(line int) string {
+		best := ""
+		bestSpan := 1<<31 - 1
+		for _, r := range ranges {
+			if line >= r.startLine && line <= r.endLine {
+				span := r.endLine - r.startLine
+				if span < bestSpan {
+					bestSpan = span
+					best = r.qname
+				}
+			}
+		}
+		return best
+	}
+
+	walkTree(root, func(node *sitter.Node) {
+		if node.Type() != "call_expression" {
+			return
+		}
+
+		line := int(node.StartPoint().Row) + 1
+
+		// Pattern A: fetch("url") — bare identifier call
+		fnIdent := findChild(node, "identifier")
+		if fnIdent != nil && fnIdent.Content(src) == "fetch" {
+			args := findChild(node, "arguments")
+			if args != nil {
+				url := extractAPIURLArg(args, src)
+				if url != "" && looksLikeAPIPath(url) {
+					refs = append(refs, parser.RawReference{
+						FromSymbol:    findEnclosing(line),
+						ToName:        normalizeAPIPath(url),
+						ReferenceType: "calls_api",
+						Confidence:    0.9,
+						Line:          line,
+					})
+				}
+			}
+			return
+		}
+
+		// Pattern B: member expression calls — axios.get(...), http.get(...), this.$http.post(...)
+		memberExpr := findChild(node, "member_expression")
+		if memberExpr == nil {
+			return
+		}
+
+		methodName := ""
+		for i := int(memberExpr.ChildCount()) - 1; i >= 0; i-- {
+			child := memberExpr.Child(i)
+			if child.Type() == "property_identifier" || child.Type() == "identifier" {
+				methodName = child.Content(src)
+				break
+			}
+		}
+
+		rootObj := extractRootIdentifier(memberExpr, src)
+		isHTTPClient := rootObj == "axios" || rootObj == "http" || rootObj == "https" ||
+			rootObj == "request" || rootObj == "got" || rootObj == "superagent" ||
+			rootObj == "ky" || rootObj == "wretch" || rootObj == "api" ||
+			rootObj == "$" || rootObj == "sf" || rootObj == "jQuery"
+
+		httpVerbs := map[string]string{
+			"get":     "GET",
+			"post":    "POST",
+			"put":     "PUT",
+			"patch":   "PATCH",
+			"delete":  "DELETE",
+			"head":    "HEAD",
+			"options": "OPTIONS",
+			"request": "", // generic
+			"ajax":    "", // generic jQuery
+		}
+
+		verb, isVerb := httpVerbs[strings.ToLower(methodName)]
+
+		switch {
+		// axios.get("/api/users"), http.get("/api/users"), etc.
+		case isHTTPClient && isVerb:
+			args := findChild(node, "arguments")
+			if args == nil {
+				return
+			}
+
+			// axios({ method: "post", url: "/api/..." }) — config object form
+			if strings.ToLower(methodName) == "request" || strings.ToLower(methodName) == "ajax" || rootObj == "axios" || rootObj == "$" || rootObj == "jQuery" {
+				if urlFromObj := extractObjectStringProp(args, src, "url"); urlFromObj != "" && looksLikeAPIPath(urlFromObj) {
+					verbFromObj := strings.ToUpper(extractObjectStringProp(args, src, "method"))
+					if verbFromObj == "" {
+						verbFromObj = verb
+					}
+					route := verbFromObj + " " + normalizeAPIPath(urlFromObj)
+					refs = append(refs, parser.RawReference{
+						FromSymbol:    findEnclosing(line),
+						ToName:        strings.TrimSpace(route),
+						ReferenceType: "calls_api",
+						Confidence:    0.9,
+						Line:          line,
+					})
+					return
+				}
+			}
+
+			url := extractAPIURLArg(args, src)
+			if url == "" || !looksLikeAPIPath(url) {
+				return
+			}
+			route := strings.TrimSpace(verb + " " + normalizeAPIPath(url))
+			refs = append(refs, parser.RawReference{
+				FromSymbol:    findEnclosing(line),
+				ToName:        route,
+				ReferenceType: "calls_api",
+				Confidence:    0.9,
+				Line:          line,
+			})
+		}
+	})
+
+	return refs
+}
+
+// extractAPIURLArg extracts the first URL-like string or template string from an arguments node.
+// It also handles common concatenation patterns like "/api/users/" + id.
+func extractAPIURLArg(args *sitter.Node, src []byte) string {
+	for i := 0; i < int(args.ChildCount()); i++ {
+		child := args.Child(i)
+		switch child.Type() {
+		case "string":
+			return extractStringContent(child, src)
+		case "template_string":
+			// Preserve the raw template for normalisation, replacing ${...} later.
+			return extractTemplateStringContent(child, src)
+		case "binary_expression":
+			// "/api/users/" + id  →  extract just the string prefix
+			if url := extractStringPrefixFromBinaryExpr(child, src); url != "" {
+				return url + "{*}"
+			}
+		}
+	}
+	return ""
+}
+
+// extractStringPrefixFromBinaryExpr returns the leading string literal from a
+// binary_expression (concatenation), e.g. "/api/users/" from "/api/users/" + id.
+func extractStringPrefixFromBinaryExpr(node *sitter.Node, src []byte) string {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child.Type() == "string" {
+			s := extractStringContent(child, src)
+			if s != "" {
+				return s
+			}
+		}
+		// Recurse in case of nested concatenation: ("api/" + base) + id
+		if child.Type() == "binary_expression" {
+			if s := extractStringPrefixFromBinaryExpr(child, src); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+// extractTemplateStringContent returns the text content of a template_string node,
+// keeping `${}` expressions as-is so normalizeAPIPath can convert them.
+func extractTemplateStringContent(node *sitter.Node, src []byte) string {
+	text := node.Content(src)
+	// Strip surrounding backticks.
+	return strings.Trim(text, "`")
+}
+
+// looksLikeAPIPath returns true when the string is plausibly an internal API path.
+// We require it to start with "/" and contain at least one path segment, or start
+// with "/api" which is the most common convention.
+func looksLikeAPIPath(s string) bool {
+	if s == "" || s == "/" {
+		return false
+	}
+	// Reject fully-qualified external URLs (http:// https://)
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+		// Still consider internal base-URL patterns like "http://localhost/api/..."
+		if !strings.Contains(s, "/api/") && !strings.Contains(s, "/v1/") && !strings.Contains(s, "/v2/") {
+			return false
+		}
+		return true
+	}
+	// If it's passed to fetch/axios/ajax, it's an API path even if relative.
+	return true
+}
+
+// normalizeAPIPath converts a raw URL string (possibly a template literal or
+// fully-qualified URL) into a canonical path used for cross-language matching.
+//
+// Transformations applied:
+//   - Strip scheme + host from fully-qualified URLs
+//   - Replace template expressions ${...} with {*}
+//   - Replace Express-style :param with {*}
+//   - Remove trailing slashes
+func normalizeAPIPath(raw string) string {
+	s := raw
+
+	// Strip scheme+host from fully-qualified URLs
+	if idx := strings.Index(s, "://"); idx >= 0 {
+		rest := s[idx+3:]
+		if slashIdx := strings.IndexByte(rest, '/'); slashIdx >= 0 {
+			s = rest[slashIdx:]
+		}
+	}
+
+	// Strip query string and fragment
+	if idx := strings.IndexByte(s, '?'); idx >= 0 {
+		s = s[:idx]
+	}
+	if idx := strings.IndexByte(s, '#'); idx >= 0 {
+		s = s[:idx]
+	}
+
+	// Replace JS template expressions ${...} with {*}
+	for {
+		start := strings.Index(s, "${")
+		if start < 0 {
+			break
+		}
+		end := strings.IndexByte(s[start:], '}')
+		if end < 0 {
+			break
+		}
+		s = s[:start] + "{*}" + s[start+end+1:]
+	}
+
+	// Replace Express-style :param segments with {*}
+	parts := strings.Split(s, "/")
+	for i, part := range parts {
+		if strings.HasPrefix(part, ":") && len(part) > 1 {
+			parts[i] = "{*}"
+		}
+	}
+	s = strings.Join(parts, "/")
+
+	// Remove trailing slash
+	s = strings.TrimRight(s, "/")
+
+	return s
 }

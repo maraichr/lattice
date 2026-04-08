@@ -12,11 +12,11 @@ import (
 	"github.com/maraichr/lattice/internal/store/postgres"
 )
 
-// PersistResults writes parsed file results to PostgreSQL.
-// Returns counts of files, symbols, and edges persisted.
-func PersistResults(ctx context.Context, s *store.Store, results []parser.FileResult) (files, symbols, edges int, err error) {
+// PersistResults writes parsed file results to PostgreSQL, including column references.
+// indexRunID is used to namespace column references for later retrieval by the lineage stage.
+// Returns counts of files, symbols, and intra-file edges persisted.
+func PersistResults(ctx context.Context, s *store.Store, indexRunID uuid.UUID, results []parser.FileResult) (files, symbols, edges int, err error) {
 	for _, fr := range results {
-		// Upsert file
 		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(fr.Path)))
 		if fr.Hash != "" {
 			hash = fr.Hash
@@ -35,10 +35,9 @@ func PersistResults(ctx context.Context, s *store.Store, results []parser.FileRe
 		}
 		files++
 
-		// Delete existing symbols for this file (re-index)
+		// Delete existing symbols for this file (re-index).
 		_ = s.DeleteSymbolsByFile(ctx, dbFile.ID)
 
-		// Insert symbols, tracking qualified_name -> ID for edge resolution
 		symbolIDs := make(map[string]uuid.UUID)
 
 		for _, sym := range fr.Symbols {
@@ -49,7 +48,6 @@ func PersistResults(ctx context.Context, s *store.Store, results []parser.FileRe
 			symbolIDs[sym.QualifiedName] = created.ID
 			symbols++
 
-			// Also insert child symbols (e.g., columns)
 			for _, child := range sym.Children {
 				childCreated, err := createSymbol(ctx, s, fr.ProjectID, dbFile.ID, child)
 				if err != nil {
@@ -60,7 +58,7 @@ func PersistResults(ctx context.Context, s *store.Store, results []parser.FileRe
 			}
 		}
 
-		// Insert edges (best-effort: skip if source or target symbol not found)
+		// Insert intra-file edges (best-effort: cross-file edges resolved later).
 		for _, ref := range fr.References {
 			sourceID, ok := symbolIDs[ref.FromSymbol]
 			if !ok {
@@ -68,9 +66,26 @@ func PersistResults(ctx context.Context, s *store.Store, results []parser.FileRe
 			}
 			targetID, ok := symbolIDs[ref.ToQualified]
 			if !ok {
-				// Try unqualified name
 				targetID, ok = symbolIDs[ref.ToName]
 				if !ok {
+					// Not intra-file — persist as raw reference for cross-file resolution.
+					var line *int32
+					if ref.Line > 0 {
+						l := int32(ref.Line)
+						line = &l
+					}
+					_ = s.InsertRawReference(ctx, postgres.InsertRawReferenceParams{
+						ProjectID:     fr.ProjectID,
+						IndexRunID:    indexRunID,
+						FileID:        dbFile.ID,
+						FromSymbol:    ref.FromSymbol,
+						ToName:        ref.ToName,
+						ToQualified:   ref.ToQualified,
+						ReferenceType: ref.ReferenceType,
+						Confidence:    ref.Confidence,
+						Line:          line,
+						Language:      fr.Language,
+					})
 					continue
 				}
 			}
@@ -82,10 +97,36 @@ func PersistResults(ctx context.Context, s *store.Store, results []parser.FileRe
 				EdgeType:  ref.ReferenceType,
 			})
 			if err != nil {
-				// ON CONFLICT DO NOTHING means this is ok
 				continue
 			}
 			edges++
+		}
+
+		// Persist column references to DB so the lineage stage can process them
+		// after all parse chunks complete, without keeping them in memory.
+		for _, colRef := range fr.ColumnReferences {
+			var expr, ctxStr *string
+			if colRef.Expression != "" {
+				expr = &colRef.Expression
+			}
+			if colRef.Context != "" {
+				ctxStr = &colRef.Context
+			}
+			var line *int32
+			if colRef.Line > 0 {
+				l := int32(colRef.Line)
+				line = &l
+			}
+			_ = s.InsertColumnReference(ctx, postgres.InsertColumnReferenceParams{
+				ProjectID:      fr.ProjectID,
+				IndexRunID:     indexRunID,
+				SourceColumn:   colRef.SourceColumn,
+				TargetColumn:   colRef.TargetColumn,
+				DerivationType: colRef.DerivationType,
+				Expression:     expr,
+				Context:        ctxStr,
+				Line:           line,
+			})
 		}
 	}
 
