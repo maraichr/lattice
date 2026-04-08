@@ -21,7 +21,7 @@ func NewResolveStage(engine *resolver.Engine) *ResolveStage {
 func (s *ResolveStage) Name() string { return "resolve" }
 
 func (s *ResolveStage) Execute(ctx context.Context, rc *IndexRunContext) error {
-	created, err := s.engine.ResolveProject(ctx, rc.ProjectID)
+	created, err := s.engine.ResolveProject(ctx, rc.ProjectID, rc.IndexRunID)
 	if err != nil {
 		return fmt.Errorf("resolve: %w", err)
 	}

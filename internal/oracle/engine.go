@@ -13,6 +13,10 @@ import (
 	"github.com/maraichr/lattice/internal/store/postgres"
 )
 
+// NOTE: LLM-based intent routing now lives in tools.AskCodebaseHandler.
+// The Oracle engine is a thin wrapper that adds session management and
+// structured block responses on top of ask_codebase.
+
 // Request is the input to the Oracle engine.
 type Request struct {
 	Question  string `json:"question"`
@@ -20,11 +24,10 @@ type Request struct {
 	Verbosity string `json:"verbosity,omitempty"`
 }
 
-// Engine is the Oracle core: routes questions via LLM, delegates to MCP tool handlers.
+// Engine is the Oracle core: delegates to ask_codebase MCP handler with session management.
 type Engine struct {
 	store   *store.Store
 	session *session.Manager
-	llm     *llm.Client
 	ask     *tools.AskCodebaseHandler
 	logger  *slog.Logger
 }
@@ -34,8 +37,7 @@ func NewEngine(s *store.Store, sm *session.Manager, llmClient *llm.Client, embed
 	return &Engine{
 		store:   s,
 		session: sm,
-		llm:     llmClient,
-		ask:     tools.NewAskCodebaseHandler(s, sm, embedder, logger),
+		ask:     tools.NewAskCodebaseHandler(s, sm, embedder, llmClient, logger),
 		logger:  logger,
 	}
 }
@@ -46,6 +48,7 @@ func (e *Engine) Store() *store.Store {
 }
 
 // Ask processes a user question for a given project.
+// Routing is handled by ask_codebase (LLM when available, keyword fallback).
 func (e *Engine) Ask(ctx context.Context, project postgres.Project, req Request) (*Response, error) {
 	// 1. Load/create session
 	sess, err := e.session.Load(ctx, req.SessionID)
@@ -54,22 +57,11 @@ func (e *Engine) Ask(ctx context.Context, project postgres.Project, req Request)
 		sess, _ = e.session.Load(ctx, "")
 	}
 
-	// 2. Route intent via LLM (with fallback to MCP's classifyIntent)
-	var toolName string
-	sel, err := routeIntent(ctx, e.llm, req.Question, sess.RecapText())
-	if err != nil {
-		e.logger.Warn("LLM routing failed, using MCP intent classification", slog.String("error", err.Error()))
-		toolName = "ask_codebase"
-	} else {
-		toolName = sel.Tool
-	}
-
-	e.logger.Info("oracle routed",
+	e.logger.Info("oracle query",
 		slog.String("question", req.Question),
-		slog.String("tool", toolName),
 		slog.String("session", sess.ID))
 
-	// 3. Delegate to ask_codebase MCP handler (it does its own intent classification)
+	// 2. Delegate to ask_codebase (handles LLM routing + keyword fallback internally)
 	markdown, err := e.ask.Handle(ctx, tools.AskCodebaseParams{
 		Project:   project.Slug,
 		Question:  req.Question,
@@ -80,28 +72,26 @@ func (e *Engine) Ask(ctx context.Context, project postgres.Project, req Request)
 		return nil, fmt.Errorf("ask_codebase: %w", err)
 	}
 
-	// 4. Build Oracle response from MCP markdown
+	// 3. Build Oracle response
 	blocks := []Block{
 		textBlock(markdown),
 	}
+	hints := generateHints("ask_codebase")
 
-	// 5. Generate hints based on routed tool
-	hints := generateHints(toolName)
-
-	// 6. Update session
+	// 4. Update session
 	sess.AddQuery(req.Question)
-	sess.AddRecap(fmt.Sprintf("Asked about: %s (tool: %s)", req.Question, toolName))
+	sess.AddRecap(fmt.Sprintf("Asked about: %s", req.Question))
 	if err := e.session.Save(ctx, sess); err != nil {
 		e.logger.Warn("failed to save session", slog.String("error", err.Error()))
 	}
 
 	return &Response{
 		SessionID: sess.ID,
-		Tool:      toolName,
+		Tool:      "ask_codebase",
 		Blocks:    blocks,
 		Hints:     hints,
 		Meta: ResponseMeta{
-			ToolSelected: toolName,
+			ToolSelected: "ask_codebase",
 			TotalResults: 1,
 			Shown:        1,
 		},

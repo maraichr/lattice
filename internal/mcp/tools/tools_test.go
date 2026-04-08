@@ -241,3 +241,66 @@ func TestIdentifyCore(t *testing.T) {
 		t.Error("non-seed symbols should not be core")
 	}
 }
+
+// --- agentToolCatalog ---
+
+func TestAgentToolCatalog_HasExpectedTools(t *testing.T) {
+	catalog := agentToolCatalog()
+
+	expected := map[string]bool{
+		"search_symbols":        false,
+		"get_lineage":           false,
+		"analyze_impact":        false,
+		"extract_subgraph":      false,
+		"trace_cross_language":  false,
+		"get_project_analytics": false,
+		"semantic_search":       false,
+	}
+
+	for _, tool := range catalog {
+		if tool.Type != "function" {
+			t.Errorf("tool %s has type %q, want 'function'", tool.Function.Name, tool.Type)
+		}
+		if _, ok := expected[tool.Function.Name]; ok {
+			expected[tool.Function.Name] = true
+		} else {
+			t.Errorf("unexpected tool in catalog: %s", tool.Function.Name)
+		}
+	}
+
+	for name, found := range expected {
+		if !found {
+			t.Errorf("expected tool %s not in catalog", name)
+		}
+	}
+}
+
+func TestAgentToolCatalog_ExcludesAskCodebase(t *testing.T) {
+	catalog := agentToolCatalog()
+	for _, tool := range catalog {
+		if tool.Function.Name == "ask_codebase" {
+			t.Error("ask_codebase should not be in agent tool catalog (would cause recursion)")
+		}
+		if tool.Function.Name == "list_projects" {
+			t.Error("list_projects should not be in agent tool catalog")
+		}
+	}
+}
+
+// --- dispatchToolCall ---
+
+func TestDispatchToolCall_UnknownTool(t *testing.T) {
+	h := &AskCodebaseHandler{}
+	result := h.dispatchToolCall(nil, "nonexistent_tool", `{}`, "test-project")
+	if !contains(result, "Unknown tool") {
+		t.Errorf("expected 'Unknown tool' error, got %q", result)
+	}
+}
+
+func TestDispatchToolCall_InvalidJSON(t *testing.T) {
+	h := &AskCodebaseHandler{}
+	result := h.dispatchToolCall(nil, "search_symbols", `{invalid`, "test-project")
+	if !contains(result, "Error parsing") {
+		t.Errorf("expected parsing error, got %q", result)
+	}
+}

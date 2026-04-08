@@ -672,6 +672,158 @@ func refsToNames(refs []parser.RawReference) []string {
 }
 
 // ---------------------------------------------------------------------------
+// Method invocation and type reference extraction tests
+// ---------------------------------------------------------------------------
+
+func TestMethodInvocationExtraction(t *testing.T) {
+	src := `
+namespace MyApp.Services {
+    public class OrderService {
+        private readonly IUserService _userService;
+
+        public void ProcessOrder(int orderId) {
+            var user = _userService.GetUser(orderId);
+            var validator = new OrderValidator();
+            validator.Validate(user);
+        }
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "OrderService.cs", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(result.References, "calls")
+	assertRefTarget(t, callRefs, "GetUser")
+	assertRefTarget(t, callRefs, "Validate")
+
+	refRefs := filterRefs(result.References, "references")
+	assertRefTarget(t, refRefs, "OrderValidator")
+}
+
+func TestTypeReferenceExtraction(t *testing.T) {
+	src := `
+namespace MyApp.Services {
+    public class UserService {
+        private UserRepository _repo;
+        public UserDto GetUser(UserQuery query) {
+            return null;
+        }
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "UserService.cs", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	refRefs := filterRefs(result.References, "references")
+	assertRefTarget(t, refRefs, "UserRepository")
+	assertRefTarget(t, refRefs, "UserDto")
+	assertRefTarget(t, refRefs, "UserQuery")
+}
+
+func TestObjectCreationExtraction(t *testing.T) {
+	src := `
+namespace MyApp {
+    public class Factory {
+        public void Create() {
+            var svc = new UserService();
+            var repo = new OrderRepository();
+        }
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "Factory.cs", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	refRefs := filterRefs(result.References, "references")
+	assertRefTarget(t, refRefs, "UserService")
+	assertRefTarget(t, refRefs, "OrderRepository")
+}
+
+// ---------------------------------------------------------------------------
+// DNN controller endpoint extraction tests
+// ---------------------------------------------------------------------------
+
+func TestDNNControllerEndpoints(t *testing.T) {
+	src := `
+namespace DotNetNuke.Modules.MyModule {
+    public class MyModuleController : DnnApiController {
+        public HttpResponseMessage GetItems() {
+            return Request.CreateResponse(HttpStatusCode.OK);
+        }
+        public HttpResponseMessage DeleteItem(int id) {
+            return Request.CreateResponse(HttpStatusCode.OK);
+        }
+        private void HelperMethod() {}
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "MyModuleController.cs", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	endpointMap := make(map[string]parser.Symbol)
+	for _, s := range result.Symbols {
+		if s.Kind == "endpoint" {
+			endpointMap[s.Signature] = s
+		}
+	}
+
+	if len(endpointMap) < 2 {
+		t.Fatalf("expected at least 2 DNN endpoints, got %d: %v", len(endpointMap), endpointMapKeys(endpointMap))
+	}
+
+	// Convention-based routes: GET /api/{controller}/{action}
+	wantRoutes := []string{
+		"GET /api/mymodule/getitems",
+		"GET /api/mymodule/deleteitem",
+	}
+	for _, want := range wantRoutes {
+		if _, ok := endpointMap[want]; !ok {
+			t.Errorf("missing DNN endpoint %q; have: %v", want, endpointMapKeys(endpointMap))
+		}
+	}
+}
+
+func TestDNNServicesApiController(t *testing.T) {
+	src := `
+namespace DotNetNuke.Modules {
+    public class ItemController : ServicesApiController {
+        public HttpResponseMessage GetItem(int id) {
+            return Request.CreateResponse(HttpStatusCode.OK);
+        }
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "ItemController.cs", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	endpointMap := make(map[string]parser.Symbol)
+	for _, s := range result.Symbols {
+		if s.Kind == "endpoint" {
+			endpointMap[s.Signature] = s
+		}
+	}
+
+	if _, ok := endpointMap["GET /api/item/getitem"]; !ok {
+		t.Errorf("missing DNN endpoint; have: %v", endpointMapKeys(endpointMap))
+	}
+}
+
+// ---------------------------------------------------------------------------
 // ASP.NET Core endpoint extraction tests
 // ---------------------------------------------------------------------------
 

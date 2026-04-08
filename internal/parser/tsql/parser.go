@@ -15,6 +15,7 @@ type Parser struct {
 	colRefs          []parser.ColumnReference
 	schema           string // current default schema
 	skipColumnLineage bool  // when true, do not extract column-level lineage (migration/schema files)
+	fileContext       string // synthetic context for top-level statements (e.g. "__file__:migrate")
 }
 
 // TSQLParser implements the parser.Parser interface.
@@ -37,6 +38,9 @@ func (t *TSQLParser) Parse(input parser.FileInput) (*parser.ParseResult, error) 
 	// Split into batches by GO
 	batches := splitBatches(tokens)
 
+	// Derive a synthetic context name from the file path for top-level statements.
+	syntheticContext := deriveFileContext(input.Path)
+
 	var allSymbols []parser.Symbol
 	var allRefs []parser.RawReference
 	var allColRefs []parser.ColumnReference
@@ -46,6 +50,7 @@ func (t *TSQLParser) Parse(input parser.FileInput) (*parser.ParseResult, error) 
 			tokens:            batch,
 			schema:            "dbo",
 			skipColumnLineage: input.SkipColumnLineage,
+			fileContext:       syntheticContext,
 		}
 		p.parseBatch()
 		allSymbols = append(allSymbols, p.symbols...)
@@ -58,6 +63,23 @@ func (t *TSQLParser) Parse(input parser.FileInput) (*parser.ParseResult, error) 
 		References:       allRefs,
 		ColumnReferences: allColRefs,
 	}, nil
+}
+
+// deriveFileContext creates a synthetic symbol name from a file path for use as
+// the context of top-level SQL statements (EXEC, SELECT, etc.) outside procedures.
+func deriveFileContext(path string) string {
+	if path == "" {
+		return ""
+	}
+	// Use just the filename without extension
+	name := path
+	if idx := strings.LastIndexAny(name, "/\\"); idx >= 0 {
+		name = name[idx+1:]
+	}
+	if idx := strings.LastIndex(name, "."); idx >= 0 {
+		name = name[:idx]
+	}
+	return "__file__:" + name
 }
 
 // stripTemplateTokens removes common SQL template placeholders used by frameworks
@@ -94,6 +116,25 @@ func splitBatches(tokens []Token) [][]Token {
 }
 
 func (p *Parser) parseBatch() {
+	// Use fileContext for top-level statements so EXEC/DML outside procedures
+	// can still generate edges. A synthetic __file__ symbol is emitted if needed.
+	ctx := p.fileContext
+	emittedFileSymbol := false
+
+	ensureFileSymbol := func() {
+		if ctx != "" && !emittedFileSymbol {
+			p.symbols = append(p.symbols, parser.Symbol{
+				Name:          ctx,
+				QualifiedName: ctx,
+				Kind:          "script",
+				Language:      "tsql",
+				StartLine:     1,
+				EndLine:       p.currentLine(),
+			})
+			emittedFileSymbol = true
+		}
+	}
+
 	for p.pos < len(p.tokens) {
 		tok := p.current()
 		if tok.Type == TokenEOF {
@@ -105,17 +146,18 @@ func (p *Parser) parseBatch() {
 			case "CREATE":
 				p.parseCreate()
 			case "SELECT":
-				p.parseSelect("")
+				p.parseSelect(ctx)
 			case "INSERT":
-				p.parseInsert("")
+				p.parseInsert(ctx)
 			case "UPDATE":
-				p.parseUpdate("")
+				p.parseUpdate(ctx)
 			case "DELETE":
-				p.parseDelete("")
+				p.parseDelete(ctx)
 			case "EXEC", "EXECUTE":
-				p.parseExec("")
+				ensureFileSymbol()
+				p.parseExec(ctx)
 			case "MERGE":
-				p.parseMerge("")
+				p.parseMerge(ctx)
 			default:
 				p.advance()
 			}

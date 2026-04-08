@@ -76,6 +76,10 @@ func (p *Parser) Parse(input parser.FileInput) (*parser.ParseResult, error) {
 		}
 	}
 
+	// Extract method body references (calls, object creation, type references)
+	methodBodyRefs := extractMethodBodyRefs(root, input.Content, namespace)
+	refs = append(refs, methodBodyRefs...)
+
 	// Build class ranges for enclosing-scope resolution (FromSymbol for SQL refs)
 	classRanges := buildClassRanges(root, input.Content, namespace)
 
@@ -1063,6 +1067,440 @@ func isSQLKeyword(s string) bool {
 }
 
 // ---------------------------------------------------------------------------
+// Method body reference extraction (calls, object creation, type references)
+// ---------------------------------------------------------------------------
+
+// extractMethodBodyRefs walks the entire tree looking for method invocations and
+// object creation expressions inside method/constructor bodies, emitting "calls"
+// and "references" edges. It also extracts type references from method parameters,
+// return types, and field/property types.
+func extractMethodBodyRefs(root *sitter.Node, src []byte, ns string) []parser.RawReference {
+	var refs []parser.RawReference
+
+	// Build method ranges: method_declaration / constructor_declaration → enclosing class qname + method name
+	type methodInfo struct {
+		qname     string // qualified name of the method
+		classQN   string // qualified name of the enclosing class
+		startByte uint32
+		endByte   uint32
+	}
+	var methods []methodInfo
+
+	walkTree(root, func(node *sitter.Node) {
+		switch node.Type() {
+		case "method_declaration", "constructor_declaration":
+			// Find enclosing class
+			classQN := findEnclosingClassNode(node, src, ns)
+			if classQN == "" {
+				return
+			}
+
+			methodName := ""
+			if node.Type() == "constructor_declaration" {
+				// Constructor name = class short name
+				parts := strings.Split(classQN, ".")
+				methodName = parts[len(parts)-1]
+			} else {
+				nameNode := node.ChildByFieldName("name")
+				if nameNode != nil {
+					methodName = nameNode.Content(src)
+				} else {
+					for i := 0; i < int(node.ChildCount()); i++ {
+						c := node.Child(i)
+						if c.Type() == "identifier" {
+							methodName = c.Content(src)
+							break
+						}
+					}
+				}
+			}
+			if methodName == "" {
+				return
+			}
+
+			qname := classQN + "." + methodName
+			methods = append(methods, methodInfo{
+				qname:     qname,
+				classQN:   classQN,
+				startByte: node.StartByte(),
+				endByte:   node.EndByte(),
+			})
+
+			// Extract return type reference (for method_declaration only)
+			if node.Type() == "method_declaration" {
+				retType := extractReturnType(node, src)
+				if retType != "" && !isPrimitiveType(retType) && !isCommonFrameworkType(retType) {
+					refs = append(refs, parser.RawReference{
+						FromSymbol:    qname,
+						ToName:        retType,
+						ReferenceType: "references",
+						Confidence:    0.7,
+						Line:          int(node.StartPoint().Row) + 1,
+					})
+				}
+			}
+
+			// Extract parameter type references
+			paramTypes := extractParamTypes(node, src)
+			for _, pt := range paramTypes {
+				if !isPrimitiveType(pt) && !isCommonFrameworkType(pt) {
+					refs = append(refs, parser.RawReference{
+						FromSymbol:    qname,
+						ToName:        pt,
+						ReferenceType: "references",
+						Confidence:    0.7,
+						Line:          int(node.StartPoint().Row) + 1,
+					})
+				}
+			}
+
+		case "field_declaration", "property_declaration":
+			classQN := findEnclosingClassNode(node, src, ns)
+			if classQN == "" {
+				return
+			}
+			typeName := extractDeclaredType(node, src)
+			if typeName != "" && !isPrimitiveType(typeName) && !isCommonFrameworkType(typeName) {
+				refs = append(refs, parser.RawReference{
+					FromSymbol:    classQN,
+					ToName:        typeName,
+					ReferenceType: "references",
+					Confidence:    0.7,
+					Line:          int(node.StartPoint().Row) + 1,
+				})
+			}
+		}
+	})
+
+	// Find the enclosing method for a given byte position
+	findMethod := func(bytePos uint32) *methodInfo {
+		var best *methodInfo
+		for i := range methods {
+			m := &methods[i]
+			if m.startByte <= bytePos && bytePos <= m.endByte {
+				if best == nil || (m.endByte-m.startByte) < (best.endByte-best.startByte) {
+					best = m
+				}
+			}
+		}
+		return best
+	}
+
+	// Walk for invocation_expression and object_creation_expression
+	walkTree(root, func(node *sitter.Node) {
+		switch node.Type() {
+		case "invocation_expression":
+			m := findMethod(node.StartByte())
+			if m == nil {
+				return
+			}
+			calledMethod := extractInvocationTarget(node, src)
+			if calledMethod == "" {
+				return
+			}
+			// Skip common framework/language methods
+			if isCommonMethod(calledMethod) {
+				return
+			}
+			refs = append(refs, parser.RawReference{
+				FromSymbol:    m.qname,
+				ToName:        calledMethod,
+				ReferenceType: "calls",
+				Confidence:    0.8,
+				Line:          int(node.StartPoint().Row) + 1,
+			})
+
+		case "object_creation_expression":
+			m := findMethod(node.StartByte())
+			if m == nil {
+				return
+			}
+			typeName := extractCreatedType(node, src)
+			if typeName == "" || isPrimitiveType(typeName) || isCommonFrameworkType(typeName) {
+				return
+			}
+			refs = append(refs, parser.RawReference{
+				FromSymbol:    m.qname,
+				ToName:        typeName,
+				ReferenceType: "references",
+				Confidence:    0.8,
+				Line:          int(node.StartPoint().Row) + 1,
+			})
+		}
+	})
+
+	return refs
+}
+
+// findEnclosingClassNode walks up the parent chain to find the enclosing class.
+func findEnclosingClassNode(node *sitter.Node, src []byte, ns string) string {
+	for p := node.Parent(); p != nil; p = p.Parent() {
+		if p.Type() == "class_declaration" || p.Type() == "struct_declaration" {
+			name := ""
+			for i := 0; i < int(p.ChildCount()); i++ {
+				c := p.Child(i)
+				if c.Type() == "identifier" {
+					name = c.Content(src)
+					break
+				}
+			}
+			if name != "" {
+				return qualifyCSharp(ns, name)
+			}
+		}
+	}
+	return ""
+}
+
+// extractInvocationTarget extracts the method name from an invocation expression.
+// For `obj.Method()` returns "Method", for `Method()` returns "Method".
+func extractInvocationTarget(node *sitter.Node, src []byte) string {
+	if node.ChildCount() == 0 {
+		return ""
+	}
+	first := node.Child(0)
+
+	switch first.Type() {
+	case "member_access_expression":
+		// Get the last identifier (the method name)
+		nameNode := first.ChildByFieldName("name")
+		if nameNode != nil {
+			return nameNode.Content(src)
+		}
+		// Fallback: last identifier child
+		for i := int(first.ChildCount()) - 1; i >= 0; i-- {
+			c := first.Child(i)
+			if c.Type() == "identifier" || c.Type() == "generic_name" {
+				name := c.Content(src)
+				// Strip generic params
+				if idx := strings.IndexByte(name, '<'); idx > 0 {
+					name = name[:idx]
+				}
+				return name
+			}
+		}
+	case "identifier":
+		return first.Content(src)
+	case "generic_name":
+		name := first.Content(src)
+		if idx := strings.IndexByte(name, '<'); idx > 0 {
+			name = name[:idx]
+		}
+		return name
+	}
+	return ""
+}
+
+// extractCreatedType extracts the type name from `new TypeName(...)`.
+func extractCreatedType(node *sitter.Node, src []byte) string {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		c := node.Child(i)
+		switch c.Type() {
+		case "identifier":
+			return c.Content(src)
+		case "qualified_name":
+			// Return last part
+			text := c.Content(src)
+			parts := strings.Split(text, ".")
+			return parts[len(parts)-1]
+		case "generic_name":
+			// Extract base name before <
+			for j := 0; j < int(c.ChildCount()); j++ {
+				gc := c.Child(j)
+				if gc.Type() == "identifier" {
+					return gc.Content(src)
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// extractReturnType extracts the return type from a method declaration.
+func extractReturnType(node *sitter.Node, src []byte) string {
+	retNode := node.ChildByFieldName("type")
+	if retNode != nil {
+		return extractTypeName(retNode, src)
+	}
+	// Fallback: scan children for the return type.
+	// In tree-sitter C#, method_declaration children are typically:
+	//   [modifiers...] [return_type] [identifier(name)] [parameter_list] [body]
+	// We look for a type-like node that is followed by the method name identifier.
+	for i := 0; i < int(node.ChildCount()); i++ {
+		c := node.Child(i)
+		switch c.Type() {
+		case "predefined_type", "generic_name", "qualified_name", "nullable_type", "array_type":
+			return extractTypeName(c, src)
+		case "identifier":
+			// Could be a return type identifier. Check if the next sibling is
+			// another identifier (the method name) or a parameter_list.
+			if i+1 < int(node.ChildCount()) {
+				next := node.Child(i + 1)
+				if next.Type() == "identifier" || next.Type() == "parameter_list" {
+					return c.Content(src)
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// extractParamTypes extracts type names from method parameters.
+func extractParamTypes(node *sitter.Node, src []byte) []string {
+	paramList := node.ChildByFieldName("parameters")
+	if paramList == nil {
+		paramList = findChild(node, "parameter_list")
+	}
+	if paramList == nil {
+		return nil
+	}
+
+	var types []string
+	for i := 0; i < int(paramList.ChildCount()); i++ {
+		param := paramList.Child(i)
+		if param.Type() != "parameter" {
+			continue
+		}
+		typeNode := param.ChildByFieldName("type")
+		if typeNode == nil {
+			// Fallback: first type-like child
+			for j := 0; j < int(param.ChildCount()); j++ {
+				c := param.Child(j)
+				if c.Type() == "identifier" || c.Type() == "generic_name" || c.Type() == "qualified_name" || c.Type() == "predefined_type" || c.Type() == "nullable_type" {
+					typeNode = c
+					break
+				}
+			}
+		}
+		if typeNode != nil {
+			typeName := extractTypeName(typeNode, src)
+			if typeName != "" {
+				types = append(types, typeName)
+			}
+		}
+	}
+	return types
+}
+
+// extractTypeName extracts a clean type name from a type node.
+func extractTypeName(node *sitter.Node, src []byte) string {
+	switch node.Type() {
+	case "predefined_type":
+		return node.Content(src)
+	case "identifier":
+		return node.Content(src)
+	case "qualified_name":
+		text := node.Content(src)
+		parts := strings.Split(text, ".")
+		return parts[len(parts)-1]
+	case "generic_name":
+		for i := 0; i < int(node.ChildCount()); i++ {
+			c := node.Child(i)
+			if c.Type() == "identifier" {
+				return c.Content(src)
+			}
+		}
+	case "nullable_type":
+		// T? → extract T
+		for i := 0; i < int(node.ChildCount()); i++ {
+			c := node.Child(i)
+			return extractTypeName(c, src)
+		}
+	case "array_type":
+		// T[] → extract T
+		for i := 0; i < int(node.ChildCount()); i++ {
+			c := node.Child(i)
+			t := extractTypeName(c, src)
+			if t != "" {
+				return t
+			}
+		}
+	}
+	return ""
+}
+
+// extractDeclaredType extracts the type from a field or property declaration.
+func extractDeclaredType(node *sitter.Node, src []byte) string {
+	// For property_declaration: the type is typically the first type-like child
+	// For field_declaration: look inside variable_declaration
+	if node.Type() == "field_declaration" {
+		varDecl := findChild(node, "variable_declaration")
+		if varDecl != nil {
+			for i := 0; i < int(varDecl.ChildCount()); i++ {
+				c := varDecl.Child(i)
+				t := extractTypeName(c, src)
+				if t != "" && !isPrimitiveType(t) {
+					return t
+				}
+			}
+		}
+		return ""
+	}
+
+	// property_declaration
+	for i := 0; i < int(node.ChildCount()); i++ {
+		c := node.Child(i)
+		switch c.Type() {
+		case "identifier", "generic_name", "qualified_name", "nullable_type", "predefined_type", "array_type":
+			t := extractTypeName(c, src)
+			if t != "" && !isPrimitiveType(t) {
+				return t
+			}
+		}
+	}
+	return ""
+}
+
+// isCommonFrameworkType returns true for types that are part of .NET framework/runtime.
+func isCommonFrameworkType(t string) bool {
+	common := map[string]bool{
+		"Task": true, "IActionResult": true, "ActionResult": true,
+		"IEnumerable": true, "ICollection": true, "IList": true, "List": true,
+		"Dictionary": true, "HashSet": true, "ILogger": true, "CancellationToken": true,
+		"HttpResponseMessage": true, "IHttpActionResult": true,
+		"IDisposable": true, "EventArgs": true, "Exception": true,
+		"StringBuilder": true, "Stream": true, "IConfiguration": true,
+		"IServiceProvider": true, "Type": true, "Attribute": true,
+		"var": true, "dynamic": true, "IFormFile": true,
+	}
+	return common[t]
+}
+
+// isCommonMethod returns true for method names that are too generic to be useful edges.
+func isCommonMethod(name string) bool {
+	common := map[string]bool{
+		"ToString": true, "GetType": true, "Equals": true, "GetHashCode": true,
+		"ReferenceEquals": true, "MemberwiseClone": true,
+		"Add": true, "Remove": true, "Contains": true, "Clear": true,
+		"Count": true, "ToList": true, "ToArray": true,
+		"Select": true, "Where": true, "FirstOrDefault": true, "First": true,
+		"SingleOrDefault": true, "Single": true, "Any": true, "All": true,
+		"OrderBy": true, "OrderByDescending": true, "GroupBy": true,
+		"Skip": true, "Take": true, "Aggregate": true, "Distinct": true,
+		"Concat": true, "Join": true, "Zip": true,
+		"Wait": true, "Result": true, "ConfigureAwait": true,
+		"Dispose": true, "Close": true, "Write": true, "Read": true,
+		"Log": true, "LogInformation": true, "LogWarning": true, "LogError": true, "LogDebug": true,
+		"Format": true, "Append": true, "AppendLine": true,
+		"Ok": true, "BadRequest": true, "NotFound": true, "StatusCode": true,
+		"Request": true, "Response": true,
+		// ADO.NET / data access methods (already handled by extractInlineSQLRefs/extractStoredProcRefs)
+		"ExecuteNonQuery": true, "ExecuteReader": true, "ExecuteScalar": true,
+		"Execute": true, "ExecuteAsync": true,
+		"FromSqlRaw": true, "FromSqlInterpolated": true,
+		"ExecuteSqlRaw": true, "ExecuteSqlInterpolated": true,
+		"SqlQuery": true, "Query": true, "QueryFirst": true, "QuerySingle": true,
+		"QueryFirstOrDefault": true, "QueryAsync": true, "QueryMultiple": true,
+		"QueryFirstAsync": true, "QuerySingleAsync": true,
+		"GetDataReader": true, "GetData": true, "BulkInsert": true, "IDataReader": true,
+		"Include": true, "ThenInclude": true,
+		// Common framework methods
+		"CreateResponse": true, "CreateErrorResponse": true,
+	}
+	return common[name]
+}
+
+// ---------------------------------------------------------------------------
 // ASP.NET Core endpoint extraction
 // ---------------------------------------------------------------------------
 
@@ -1089,10 +1527,25 @@ var aspVerbAttrs = map[string]string{
 func extractASPNetEndpoints(root *sitter.Node, src []byte, ns string) []parser.Symbol {
 	var endpoints []parser.Symbol
 
+	// DNN controller base classes that indicate an API controller.
+	dnnControllerBases := map[string]bool{
+		"DnnApiController":      true,
+		"DnnController":         true,
+		"ServicesApiController":  true,
+		"DnnModuleController":   true,
+	}
+
+	// DNN return types that indicate an API endpoint method.
+	dnnReturnTypes := map[string]bool{
+		"HttpResponseMessage": true,
+		"IHttpActionResult":   true,
+	}
+
 	// Collect class-level base routes: class_declaration → attributes → [Route("base")]
 	type controllerInfo struct {
 		qname     string
 		basePaths []string // may be multiple [Route] attributes
+		isDNN     bool     // true if inherits from a DNN controller base
 	}
 	controllers := map[string]*controllerInfo{} // name → info
 
@@ -1113,13 +1566,26 @@ func extractASPNetEndpoints(root *sitter.Node, src []byte, ns string) []parser.S
 			return
 		}
 
-		// Only process Controller classes (ASP.NET convention)
-		if !strings.HasSuffix(className, "Controller") && !hasAttributeOnNode(node, src, "ApiController") {
+		// Check for DNN controller base classes
+		isDNN := false
+		baseList := findChild(node, "base_list")
+		if baseList != nil {
+			walkTree(baseList, func(n *sitter.Node) {
+				if n.Type() == "identifier" {
+					if dnnControllerBases[n.Content(src)] {
+						isDNN = true
+					}
+				}
+			})
+		}
+
+		// Only process Controller classes (ASP.NET convention or DNN base)
+		if !isDNN && !strings.HasSuffix(className, "Controller") && !hasAttributeOnNode(node, src, "ApiController") {
 			return
 		}
 
 		qname := qualifyCSharp(ns, className)
-		info := &controllerInfo{qname: qname}
+		info := &controllerInfo{qname: qname, isDNN: isDNN}
 		controllers[className] = info
 
 		// Collect class-level [Route("...")] attributes
@@ -1143,9 +1609,7 @@ func extractASPNetEndpoints(root *sitter.Node, src []byte, ns string) []parser.S
 
 		// Default base path: [controller] → lowercase controller name without suffix
 		if len(info.basePaths) == 0 {
-			base := strings.TrimSuffix(className, "Controller")
 			info.basePaths = []string{"[controller]"}
-			_ = base
 		}
 
 		// Walk class body looking for method declarations with HTTP verb attributes
@@ -1161,11 +1625,20 @@ func extractASPNetEndpoints(root *sitter.Node, src []byte, ns string) []parser.S
 			}
 
 			methodName := ""
-			for j := 0; j < int(member.ChildCount()); j++ {
-				mc := member.Child(j)
-				if mc.Type() == "identifier" {
-					methodName = mc.Content(src)
-					break
+			nameNode := member.ChildByFieldName("name")
+			if nameNode != nil {
+				methodName = nameNode.Content(src)
+			} else {
+				// Fallback: find the identifier that precedes a parameter_list
+				for j := 0; j < int(member.ChildCount()); j++ {
+					mc := member.Child(j)
+					if mc.Type() == "identifier" && j+1 < int(member.ChildCount()) {
+						next := member.Child(j + 1)
+						if next.Type() == "parameter_list" {
+							methodName = mc.Content(src)
+							break
+						}
+					}
 				}
 			}
 			if methodName == "" {
@@ -1173,6 +1646,7 @@ func extractASPNetEndpoints(root *sitter.Node, src []byte, ns string) []parser.S
 			}
 
 			// Collect all routing attributes on this method
+			hasRoutingAttr := false
 			for j := 0; j < int(member.ChildCount()); j++ {
 				mc := member.Child(j)
 				if mc.Type() != "attribute_list" {
@@ -1187,6 +1661,7 @@ func extractASPNetEndpoints(root *sitter.Node, src []byte, ns string) []parser.S
 					if !isRoutingAttr {
 						return
 					}
+					hasRoutingAttr = true
 
 					methodPath := extractAttrStringParam(attr, src)
 
@@ -1206,6 +1681,25 @@ func extractASPNetEndpoints(root *sitter.Node, src []byte, ns string) []parser.S
 						endpoints = append(endpoints, sym)
 					}
 				})
+			}
+
+			// DNN convention-based routing: public methods returning HttpResponseMessage
+			// or IHttpActionResult without explicit routing attributes get convention routes.
+			if !hasRoutingAttr && isDNN && isPublicMethod(member, src) {
+				retType := extractReturnType(member, src)
+				if dnnReturnTypes[retType] {
+					controllerShort := strings.TrimSuffix(className, "Controller")
+					route := "GET /api/" + strings.ToLower(controllerShort) + "/" + strings.ToLower(methodName)
+					endpoints = append(endpoints, parser.Symbol{
+						Name:          methodName,
+						QualifiedName: qname + "." + methodName,
+						Kind:          "endpoint",
+						Language:      "csharp",
+						StartLine:     int(member.StartPoint().Row) + 1,
+						EndLine:       int(member.EndPoint().Row) + 1,
+						Signature:     route,
+					})
+				}
 			}
 		}
 	})
@@ -1314,6 +1808,17 @@ func extractAttrStringParam(attr *sitter.Node, src []byte) string {
 		}
 	}
 	return ""
+}
+
+// isPublicMethod returns true if a method_declaration has the "public" modifier.
+func isPublicMethod(node *sitter.Node, src []byte) bool {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child.Type() == "modifier" && child.Content(src) == "public" {
+			return true
+		}
+	}
+	return false
 }
 
 // hasAttributeOnNode returns true if the node has an attribute list containing an attribute with the given name.

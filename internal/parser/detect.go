@@ -1,15 +1,22 @@
 package parser
 
 import (
+	"regexp"
 	"strings"
 )
 
-// DetectDialect determines whether a .sql file is T-SQL or PostgreSQL.
-func DetectDialect(content []byte) string {
+// backtickRe matches backtick-quoted identifiers (MySQL style).
+var backtickRe = regexp.MustCompile("`\\w+`")
+
+// DetectDialect determines whether a SQL file is T-SQL, PostgreSQL, or MySQL based on
+// content analysis and file extension hints. The extension (e.g. ".sql",
+// ".sqldataprovider") is used as a tiebreaker when content alone is ambiguous.
+func DetectDialect(content []byte, ext string) string {
 	text := strings.ToUpper(string(content))
 
 	tsqlScore := 0
 	pgsqlScore := 0
+	mysqlScore := 0
 
 	// T-SQL indicators
 	if strings.Contains(text, "\nGO\n") || strings.Contains(text, "\nGO\r\n") || strings.HasSuffix(text, "\nGO") {
@@ -36,13 +43,47 @@ func DetectDialect(content []byte) string {
 		}
 	}
 
-	if tsqlScore > pgsqlScore {
-		return "tsql"
+	// MySQL indicators
+	if strings.Contains(text, "\nDELIMITER ") || strings.HasPrefix(text, "DELIMITER ") {
+		mysqlScore += 10 // DELIMITER is definitive for MySQL
 	}
-	if pgsqlScore > tsqlScore {
-		return "pgsql"
+	for _, kw := range []string{"AUTO_INCREMENT", "ENGINE=", "TINYINT", "MEDIUMINT",
+		"UNSIGNED", "ENUM(", "SET(", "SHOW TABLES", "SHOW COLUMNS",
+		"DEFINER=", "DEFAULT CHARSET", "COLLATE UTF8", "ON DUPLICATE KEY",
+		"IFNULL(", "MEDIUMTEXT", "LONGTEXT", "TINYBLOB", "MEDIUMBLOB", "LONGBLOB"} {
+		if strings.Contains(text, kw) {
+			mysqlScore += 2
+		}
+	}
+	// Backtick-quoted identifiers are MySQL-specific
+	if backtickRe.Match(content) {
+		mysqlScore += 2
 	}
 
-	// Default to pgsql for ambiguous cases
-	return "pgsql"
+	// Three-way max
+	if tsqlScore >= pgsqlScore && tsqlScore >= mysqlScore {
+		if tsqlScore > 0 {
+			return "tsql"
+		}
+	}
+	if pgsqlScore >= tsqlScore && pgsqlScore >= mysqlScore {
+		if pgsqlScore > 0 {
+			return "pgsql"
+		}
+	}
+	if mysqlScore > tsqlScore && mysqlScore > pgsqlScore {
+		return "mysql"
+	}
+
+	// Tie: use file extension as a hint. Non-.sql extensions registered with
+	// the SQL router (e.g. ".sqldataprovider") are more likely T-SQL since
+	// PostgreSQL ecosystems rarely use custom SQL extensions.
+	if ext != "" && ext != ".sql" {
+		return "tsql"
+	}
+
+	// Both scores zero or tied with a plain .sql file: default to tsql.
+	// PostgreSQL files almost always contain strong markers ($$, LANGUAGE
+	// PLPGSQL, ::casts), so a file with no markers is more likely T-SQL.
+	return "tsql"
 }

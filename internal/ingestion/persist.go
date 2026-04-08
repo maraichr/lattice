@@ -68,6 +68,24 @@ func PersistResults(ctx context.Context, s *store.Store, indexRunID uuid.UUID, r
 			if !ok {
 				targetID, ok = symbolIDs[ref.ToName]
 				if !ok {
+					// Not intra-file — persist as raw reference for cross-file resolution.
+					var line *int32
+					if ref.Line > 0 {
+						l := int32(ref.Line)
+						line = &l
+					}
+					_ = s.InsertRawReference(ctx, postgres.InsertRawReferenceParams{
+						ProjectID:     fr.ProjectID,
+						IndexRunID:    indexRunID,
+						FileID:        dbFile.ID,
+						FromSymbol:    ref.FromSymbol,
+						ToName:        ref.ToName,
+						ToQualified:   ref.ToQualified,
+						ReferenceType: ref.ReferenceType,
+						Confidence:    ref.Confidence,
+						Line:          line,
+						Language:      fr.Language,
+					})
 					continue
 				}
 			}

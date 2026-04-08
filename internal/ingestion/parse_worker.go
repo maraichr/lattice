@@ -87,10 +87,15 @@ func (w *ParseWorker) parseFile(task ParseTaskMessage, absPath, relPath string, 
 		return nil
 	}
 
+	// Strip UTF-8 BOM if present (common in DNN Platform SQL files).
+	if len(content) >= 3 && content[0] == 0xEF && content[1] == 0xBB && content[2] == 0xBF {
+		content = content[3:]
+	}
+
 	ext := strings.ToLower(filepath.Ext(absPath))
 	language := "sql"
 	if ext == ".sql" || ext == ".sqldataprovider" {
-		language = parser.DetectDialect(content)
+		language = parser.DetectDialect(content, ext)
 	} else if ext != "" {
 		// Use the extension minus the dot as the language for non-SQL files.
 		language = strings.TrimPrefix(ext, ".")

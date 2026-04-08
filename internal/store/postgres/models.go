@@ -24,6 +24,19 @@ type ApiKey struct {
 	CreatedAt time.Time          `json:"created_at"`
 }
 
+type ColumnReference struct {
+	ID             uuid.UUID `json:"id"`
+	ProjectID      uuid.UUID `json:"project_id"`
+	IndexRunID     uuid.UUID `json:"index_run_id"`
+	SourceColumn   string    `json:"source_column"`
+	TargetColumn   string    `json:"target_column"`
+	DerivationType string    `json:"derivation_type"`
+	Expression     *string   `json:"expression"`
+	Context        *string   `json:"context"`
+	Line           *int32    `json:"line"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
 type File struct {
 	ID            uuid.UUID          `json:"id"`
 	ProjectID     uuid.UUID          `json:"project_id"`
@@ -86,6 +99,21 @@ type ProjectMember struct {
 	UserID    uuid.UUID `json:"user_id"`
 	Role      string    `json:"role"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+type RawReference struct {
+	ID            uuid.UUID `json:"id"`
+	ProjectID     uuid.UUID `json:"project_id"`
+	IndexRunID    uuid.UUID `json:"index_run_id"`
+	FileID        uuid.UUID `json:"file_id"`
+	FromSymbol    string    `json:"from_symbol"`
+	ToName        string    `json:"to_name"`
+	ToQualified   string    `json:"to_qualified"`
+	ReferenceType string    `json:"reference_type"`
+	Confidence    float64   `json:"confidence"`
+	Line          *int32    `json:"line"`
+	Language      string    `json:"language"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 type Source struct {

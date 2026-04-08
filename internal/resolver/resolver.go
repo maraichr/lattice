@@ -36,64 +36,40 @@ func NewEngine(s *store.Store, logger *slog.Logger) *Engine {
 }
 
 // ResolveProject performs cross-file symbol resolution for all unresolved references
-// in a project, reading entirely from the database in a paginated fashion.
+// in a project by reading raw references from the staging table (persisted during
+// the parse/persist phase) and resolving them against the project's symbol table.
 //
 // This is the primary entry point used by the distributed pipeline. All parse workers
-// have already persisted symbols before this runs. The resolver:
-//  1. Pages through all project files and their symbols to collect reference targets.
-//  2. Issues targeted batch SQL lookups to find matches without loading everything at once.
-//  3. Creates SymbolEdge records for each successfully resolved reference.
+// have already persisted symbols and raw references before this runs. The resolver:
+//  1. Loads raw references from the staging table for this index run.
+//  2. Builds a partial symbol table from the referenced target names.
+//  3. For each raw reference, resolves source and target, creating SymbolEdge records.
+//  4. Cleans up the staging table after resolution.
 //
 // Returns the number of new edges created.
-func (e *Engine) ResolveProject(ctx context.Context, projectID uuid.UUID) (int, error) {
-	// Load all files for the project (files table is small relative to symbols).
-	files, err := e.store.ListFilesByProject(ctx, projectID)
+func (e *Engine) ResolveProject(ctx context.Context, projectID, indexRunID uuid.UUID) (int, error) {
+	// Load raw references persisted by parse workers.
+	rawRefs, err := e.store.ListRawReferencesByIndexRun(ctx, indexRunID)
 	if err != nil {
-		return 0, fmt.Errorf("load files: %w", err)
+		return 0, fmt.Errorf("load raw references: %w", err)
 	}
-	if len(files) == 0 {
+	if len(rawRefs) == 0 {
+		e.logger.Info("no raw references to resolve")
 		return 0, nil
 	}
 
-	fileIDs := make([]uuid.UUID, len(files))
-	for i, f := range files {
-		fileIDs[i] = f.ID
-	}
-
-	// Load symbols for all files (chunked by file IDs to stay memory-bounded).
-	localSymbols, err := e.loadFileSymbols(ctx, fileIDs)
-	if err != nil {
-		return 0, fmt.Errorf("load file symbols: %w", err)
-	}
-
-	// Collect all unresolved reference target names across the project.
+	// Collect target names from raw references.
 	var fqnTargets []string
 	var shortTargets []string
-	for _, scope := range localSymbols {
-		// We need to scan the edges table to find unresolved refs — instead we
-		// build candidate names from all known symbol names in local scopes,
-		// which covers the vast majority of cross-file references.
-		_ = scope
-	}
-
-	// Page through all project symbols to gather reference name candidates.
-	var offset int64
-	for {
-		page, err := e.store.GetSymbolsByProjectPaged(ctx, projectID, symbolPageSize, offset)
-		if err != nil {
-			return 0, fmt.Errorf("page symbols (offset %d): %w", offset, err)
+	fileIDSet := make(map[uuid.UUID]struct{})
+	for _, rr := range rawRefs {
+		if rr.ToQualified != "" {
+			fqnTargets = append(fqnTargets, rr.ToQualified)
 		}
-		if len(page) == 0 {
-			break
+		if rr.ToName != "" {
+			shortTargets = append(shortTargets, rr.ToName)
 		}
-		for _, sym := range page {
-			fqnTargets = append(fqnTargets, sym.QualifiedName)
-			shortTargets = append(shortTargets, sym.Name)
-		}
-		offset += int64(len(page))
-		if int64(len(page)) < symbolPageSize {
-			break
-		}
+		fileIDSet[rr.FileID] = struct{}{}
 	}
 	fqnTargets = deduplicateStrings(fqnTargets)
 	shortTargets = deduplicateStrings(shortTargets)
@@ -119,48 +95,109 @@ func (e *Engine) ResolveProject(ctx context.Context, projectID uuid.UUID) (int, 
 		}
 	}
 
-	// Resolve: for each file's symbols, try to create cross-file edges.
-	created := 0
+	// Load local symbols for all files that have raw references.
+	fileIDs := make([]uuid.UUID, 0, len(fileIDSet))
+	for fid := range fileIDSet {
+		fileIDs = append(fileIDs, fid)
+	}
+	localSymbols, err := e.loadFileSymbols(ctx, fileIDs)
+	if err != nil {
+		return 0, fmt.Errorf("load file symbols: %w", err)
+	}
+
+	// Load file languages.
+	files, err := e.store.ListFilesByProject(ctx, projectID)
+	if err != nil {
+		return 0, fmt.Errorf("load files: %w", err)
+	}
 	fileByID := make(map[uuid.UUID]string, len(files))
 	for _, f := range files {
 		fileByID[f.ID] = f.Language
 	}
 
-	for fileID, localScope := range localSymbols {
-		fileLang := fileByID[fileID]
-		created += e.resolveFileRefs(ctx, projectID, fileID, fileLang, localScope, table)
-	}
-
-	e.logger.Info("cross-file resolution complete",
-		slog.Int("edges_created", created),
-		slog.Int("files", len(files)))
-
-	return created, nil
-}
-
-// resolveFileRefs resolves cross-file references for symbols in a single file.
-func (e *Engine) resolveFileRefs(ctx context.Context, projectID, fileID uuid.UUID, fileLang string, localScope map[string]uuid.UUID, table *partialSymbolTable) int {
-	// Fetch outgoing raw edges for this file's symbols via the symbol_edges table.
-	// We use the local scope as the source candidates and the partial table for targets.
+	// Resolve each raw reference.
 	created := 0
-	for fromQName, sourceID := range localScope {
-		// Build a synthetic reference from what we know about this symbol.
-		// We check the table for matches by short name and FQN.
-		ref := parser.RawReference{
-			FromSymbol: fromQName,
+	for _, rr := range rawRefs {
+		localScope := localSymbols[rr.FileID]
+		fileLang := rr.Language
+		if fileLang == "" {
+			fileLang = fileByID[rr.FileID]
 		}
 
-		// Skip if the source itself isn't resolvable.
+		ref := parser.RawReference{
+			FromSymbol:    rr.FromSymbol,
+			ToName:        rr.ToName,
+			ToQualified:   rr.ToQualified,
+			ReferenceType: rr.ReferenceType,
+			Confidence:    rr.Confidence,
+		}
+		if rr.Line != nil {
+			ref.Line = int(*rr.Line)
+		}
+
+		// Resolve source symbol.
+		sourceID, ok := localScope[ref.FromSymbol]
+		if !ok {
+			sourceID, ok = table.ByFQN[ref.FromSymbol]
+		}
+		if !ok && ref.FromSymbol == "" && ref.ToName != "" && ref.ReferenceType == "uses_table" {
+			sourceID = inferSourceFromFileSymbols(rr.FileID, localScope)
+		}
 		if sourceID == uuid.Nil {
 			continue
 		}
 
-		// Attempt cross-language resolution for every symbol to catch ORM/bridge patterns.
-		if e.crossLang != nil && fileLang != "" {
-			_ = ref // cross-lang matching is done in resolveTarget when called with real refs
+		result := resolveTarget(ref, localScope, table, e.crossLang, fileLang)
+		if !result.Resolved || sourceID == result.TargetID {
+			continue
 		}
+
+		confidence := result.Confidence
+		if ref.Confidence > 0 && confidence > 0 {
+			confidence = ref.Confidence * confidence
+		} else if ref.Confidence > 0 {
+			confidence = ref.Confidence
+		}
+
+		if result.CrossLang {
+			meta := map[string]interface{}{
+				"confidence":     confidence,
+				"match_strategy": result.Strategy,
+				"bridge":         result.Bridge,
+			}
+			metaJSON, _ := json.Marshal(meta)
+			_, err := e.store.CreateSymbolEdgeWithMetadata(ctx, postgres.CreateSymbolEdgeWithMetadataParams{
+				ProjectID: projectID,
+				SourceID:  sourceID,
+				TargetID:  result.TargetID,
+				EdgeType:  ref.ReferenceType,
+				Metadata:  metaJSON,
+			})
+			if err != nil {
+				continue
+			}
+		} else {
+			_, err := e.store.CreateSymbolEdge(ctx, postgres.CreateSymbolEdgeParams{
+				ProjectID: projectID,
+				SourceID:  sourceID,
+				TargetID:  result.TargetID,
+				EdgeType:  ref.ReferenceType,
+			})
+			if err != nil {
+				continue
+			}
+		}
+		created++
 	}
-	return created
+
+	// Clean up staging data.
+	_ = e.store.DeleteRawReferencesByIndexRun(ctx, indexRunID)
+
+	e.logger.Info("cross-file resolution complete",
+		slog.Int("edges_created", created),
+		slog.Int("raw_refs", len(rawRefs)))
+
+	return created, nil
 }
 
 // Resolve performs cross-file symbol resolution given explicit parse results.
@@ -305,22 +342,31 @@ func (e *Engine) Resolve(ctx context.Context, projectID uuid.UUID, parseResults 
 	return created, nil
 }
 
+// symbolCandidate holds a symbol ID along with its kind for disambiguation.
+type symbolCandidate struct {
+	ID       uuid.UUID
+	Kind     string
+	Language string
+}
+
 // partialSymbolTable is a lightweight lookup structure populated from targeted DB queries.
 // Unlike the old SymbolTable it holds only symbols that are actually referenced, not
 // the full project corpus.
 type partialSymbolTable struct {
-	ByFQN       map[string]uuid.UUID   // qualified_name → symbol ID
-	ByShortName map[string][]uuid.UUID // short name → candidate IDs (may have multiple)
-	ByLang      map[string]string      // qualified_name → language
-	BySignature map[string]uuid.UUID   // endpoint Signature → symbol ID (api_route_match)
+	ByFQN           map[string]uuid.UUID          // qualified_name → symbol ID
+	ByShortName     map[string][]uuid.UUID         // short name → candidate IDs (may have multiple)
+	ByShortNameFull map[string][]symbolCandidate   // short name → candidates with kind info
+	ByLang          map[string]string              // qualified_name → language
+	BySignature     map[string]uuid.UUID           // endpoint Signature → symbol ID (api_route_match)
 }
 
 func newPartialTable() *partialSymbolTable {
 	return &partialSymbolTable{
-		ByFQN:       make(map[string]uuid.UUID),
-		ByShortName: make(map[string][]uuid.UUID),
-		ByLang:      make(map[string]string),
-		BySignature: make(map[string]uuid.UUID),
+		ByFQN:           make(map[string]uuid.UUID),
+		ByShortName:     make(map[string][]uuid.UUID),
+		ByShortNameFull: make(map[string][]symbolCandidate),
+		ByLang:          make(map[string]string),
+		BySignature:     make(map[string]uuid.UUID),
 	}
 }
 
@@ -339,6 +385,7 @@ func (e *Engine) buildPartialTable(ctx context.Context, projectID uuid.UUID, fqn
 			table.ByFQN[sym.QualifiedName] = sym.ID
 			short := shortNameOf(sym.QualifiedName)
 			table.ByShortName[short] = appendUnique(table.ByShortName[short], sym.ID)
+			table.ByShortNameFull[short] = appendUniqueCand(table.ByShortNameFull[short], symbolCandidate{ID: sym.ID, Kind: sym.Kind, Language: sym.Language})
 			table.ByLang[sym.QualifiedName] = sym.Language
 		}
 	}
@@ -364,6 +411,7 @@ func (e *Engine) buildPartialTable(ctx context.Context, projectID uuid.UUID, fqn
 			}
 			short := shortNameOf(sym.QualifiedName)
 			table.ByShortName[short] = appendUnique(table.ByShortName[short], sym.ID)
+			table.ByShortNameFull[short] = appendUniqueCand(table.ByShortNameFull[short], symbolCandidate{ID: sym.ID, Kind: sym.Kind, Language: sym.Language})
 			table.ByLang[sym.QualifiedName] = sym.Language
 		}
 	}
@@ -433,10 +481,16 @@ func resolveTarget(ref parser.RawReference, localScope map[string]uuid.UUID, tab
 		}
 	}
 
-	// 3. Try project-wide by short name (if unambiguous).
+	// 3. Try project-wide by short name.
 	candidates := table.shortNameCandidates(ref.ToName)
 	if len(candidates) == 1 {
 		return resolveResult{TargetID: candidates[0], Confidence: 1.0, Resolved: true}
+	}
+	// When multiple candidates exist, use reference type to prefer the right kind.
+	if len(candidates) > 1 {
+		if preferred := disambiguateByKind(ref, table); preferred != uuid.Nil {
+			return resolveResult{TargetID: preferred, Confidence: 0.9, Resolved: true}
+		}
 	}
 
 	// 4. Try case-insensitive FQN match (SQL is often case-insensitive).
@@ -503,6 +557,72 @@ func appendUnique(ids []uuid.UUID, id uuid.UUID) []uuid.UUID {
 	return append(ids, id)
 }
 
+// appendUniqueCand appends a candidate only if its ID is not already present.
+func appendUniqueCand(cands []symbolCandidate, c symbolCandidate) []symbolCandidate {
+	for _, existing := range cands {
+		if existing.ID == c.ID {
+			return cands
+		}
+	}
+	return append(cands, c)
+}
+
+// disambiguateByKind tries to pick the best candidate when multiple short-name
+// matches exist, using the reference type to infer the expected symbol kind.
+func disambiguateByKind(ref parser.RawReference, table symbolIndex) uuid.UUID {
+	pt, ok := table.(interface {
+		candidatesFull(name string) []symbolCandidate
+	})
+	if !ok {
+		return uuid.Nil
+	}
+
+	cands := pt.candidatesFull(ref.ToName)
+	if len(cands) <= 1 {
+		return uuid.Nil
+	}
+
+	preferredKinds := refTypeToPreferredKinds(ref.ReferenceType)
+	if len(preferredKinds) == 0 {
+		return uuid.Nil
+	}
+
+	var filtered []symbolCandidate
+	for _, c := range cands {
+		for _, k := range preferredKinds {
+			if c.Kind == k {
+				filtered = append(filtered, c)
+				break
+			}
+		}
+	}
+
+	if len(filtered) == 1 {
+		return filtered[0].ID
+	}
+	return uuid.Nil
+}
+
+// refTypeToPreferredKinds maps reference types to the symbol kinds they typically target.
+func refTypeToPreferredKinds(refType string) []string {
+	switch refType {
+	case "inherits":
+		return []string{"class"}
+	case "implements":
+		return []string{"interface"}
+	case "uses_table", "reads_from", "writes_to":
+		return []string{"table", "view"}
+	case "calls":
+		return []string{"procedure", "function", "method"}
+	case "references":
+		return []string{"class", "interface", "enum", "type"}
+	case "joins":
+		return []string{"table", "view"}
+	default:
+		return nil
+	}
+}
+
 // ByFQNMap implements SymbolLookup for partialSymbolTable.
 func (t *partialSymbolTable) ByFQNMap() map[string]uuid.UUID { return t.ByFQN }
 
@@ -515,4 +635,9 @@ func (t *partialSymbolTable) EndpointsBySignature() map[string]uuid.UUID { retur
 // shortNameCandidates implements symbolIndex for partialSymbolTable.
 func (t *partialSymbolTable) shortNameCandidates(name string) []uuid.UUID {
 	return t.ByShortName[name]
+}
+
+// candidatesFull returns candidates with kind info for disambiguation.
+func (t *partialSymbolTable) candidatesFull(name string) []symbolCandidate {
+	return t.ByShortNameFull[name]
 }

@@ -6,6 +6,7 @@ import (
 	"github.com/valkey-io/valkey-go"
 
 	"github.com/maraichr/lattice/internal/embedding"
+	"github.com/maraichr/lattice/internal/llm"
 	"github.com/maraichr/lattice/internal/mcp/session"
 	"github.com/maraichr/lattice/internal/store"
 )
@@ -16,6 +17,7 @@ type Server struct {
 	Store    *store.Store
 	Session  *session.Manager
 	Embedder embedding.Embedder
+	LLM      *llm.Client
 	Nav      *Navigator
 	Logger   *slog.Logger
 }
@@ -25,6 +27,7 @@ type ServerDeps struct {
 	Store        *store.Store
 	ValkeyClient valkey.Client
 	Embedder     embedding.Embedder
+	LLM          *llm.Client
 	Logger       *slog.Logger
 }
 
@@ -41,6 +44,7 @@ func NewServer(deps ServerDeps) *Server {
 		Store:    deps.Store,
 		Session:  sm,
 		Embedder: deps.Embedder,
+		LLM:      deps.LLM,
 		Nav:      nav,
 		Logger:   deps.Logger,
 	}

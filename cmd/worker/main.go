@@ -22,6 +22,8 @@ import (
 	"github.com/maraichr/lattice/internal/parser/delphi"
 	javap "github.com/maraichr/lattice/internal/parser/java"
 	jsts "github.com/maraichr/lattice/internal/parser/javascript"
+	mysqlp "github.com/maraichr/lattice/internal/parser/mysql"
+	phpp "github.com/maraichr/lattice/internal/parser/php"
 	"github.com/maraichr/lattice/internal/parser/pgsql"
 	"github.com/maraichr/lattice/internal/parser/tsql"
 	"github.com/maraichr/lattice/internal/resolver"
@@ -102,7 +104,7 @@ func main() {
 
 	// Parser registry
 	registry := parser.NewRegistry()
-	sqlRouter := parser.NewSQLRouter(tsql.New(), pgsql.New())
+	sqlRouter := parser.NewSQLRouter(tsql.New(), pgsql.New(), mysqlp.New())
 	registry.Register(".sql", sqlRouter)
 	registry.Register(".sqldataprovider", sqlRouter)
 	aspParser := asp.New()
@@ -124,6 +126,9 @@ func main() {
 	tsParser := jsts.NewTS()
 	registry.Register(".ts", tsParser)
 	registry.Register(".tsx", tsParser)
+	phpParser := phpp.New()
+	registry.Register(".php", phpParser)
+	registry.Register(".phtml", phpParser)
 
 	// Embeddings (auto-selects: OpenRouter > Bedrock > disabled)
 	var embedStage ingestion.Stage
