@@ -82,6 +82,10 @@ func (p *Parser) Parse(input parser.FileInput) (*parser.ParseResult, error) {
 	jdbcRefs := extractJDBCRefs(root, input.Content, symbols)
 	refs = append(refs, jdbcRefs...)
 
+	// General method call references
+	callRefs := extractMethodCalls(root, input.Content, symbols)
+	refs = append(refs, callRefs...)
+
 	// @NamedQuery / @NamedNativeQuery detection
 	namedQueryRefs := extractNamedQueryRefs(root, input.Content, packageName)
 	refs = append(refs, namedQueryRefs...)
@@ -301,6 +305,23 @@ func extractMembers(body *sitter.Node, src []byte, pkg, className string) ([]par
 					EndLine:       int(child.EndPoint().Row) + 1,
 				})
 			}
+
+		case "class_declaration":
+			nestedPkg := qualifyJava(pkg, className)
+			nestedSyms, nestedRefs := extractClass(child, src, nestedPkg)
+			symbols = append(symbols, nestedSyms...)
+			refs = append(refs, nestedRefs...)
+
+		case "interface_declaration":
+			nestedPkg := qualifyJava(pkg, className)
+			nestedSyms, nestedRefs := extractInterface(child, src, nestedPkg)
+			symbols = append(symbols, nestedSyms...)
+			refs = append(refs, nestedRefs...)
+
+		case "enum_declaration":
+			nestedPkg := qualifyJava(pkg, className)
+			nestedSyms := extractEnum(child, src, nestedPkg)
+			symbols = append(symbols, nestedSyms...)
 		}
 	}
 
@@ -548,23 +569,6 @@ func isSQLKeyword(s string) bool {
 func extractJDBCRefs(root *sitter.Node, src []byte, symbols []parser.Symbol) []parser.RawReference {
 	var refs []parser.RawReference
 
-	// Build symbol ranges for FromSymbol resolution
-	findEnclosing := func(line int) string {
-		best := ""
-		bestSpan := 1<<31 - 1
-		for _, s := range symbols {
-			if (s.Kind == "method" || s.Kind == "function" || s.Kind == "class") &&
-				line >= s.StartLine && line <= s.EndLine {
-				span := s.EndLine - s.StartLine
-				if span < bestSpan {
-					bestSpan = span
-					best = s.QualifiedName
-				}
-			}
-		}
-		return best
-	}
-
 	walkTree(root, func(node *sitter.Node) {
 		if node.Type() != "method_invocation" {
 			return
@@ -591,7 +595,7 @@ func extractJDBCRefs(root *sitter.Node, src []byte, symbols []parser.Symbol) []p
 			if sqlStr == "" {
 				return
 			}
-			from := findEnclosing(line)
+			from := findEnclosingSymbol(line, symbols)
 			if sqlutil.LooksLikeSQL(sqlStr) {
 				tableRefs := sqlutil.ExtractTableRefs(sqlStr, line, from, "")
 				for i := range tableRefs {
@@ -973,4 +977,109 @@ func joinSpringRoute(verb, basePath, methodPath string) string {
 		return combined
 	}
 	return verb + " " + combined
+}
+
+// findEnclosingSymbol returns the qualified name of the narrowest symbol
+// (method, function, or class) that encloses the given line.
+func findEnclosingSymbol(line int, symbols []parser.Symbol) string {
+	best := ""
+	bestSpan := 1<<31 - 1
+	for _, s := range symbols {
+		if (s.Kind == "method" || s.Kind == "function" || s.Kind == "class") &&
+			line >= s.StartLine && line <= s.EndLine {
+			span := s.EndLine - s.StartLine
+			if span < bestSpan {
+				bestSpan = span
+				best = s.QualifiedName
+			}
+		}
+	}
+	return best
+}
+
+// isCommonJavaMethod returns true for methods that are too common to be useful
+// in a dependency call graph.
+func isCommonJavaMethod(name string) bool {
+	return commonJavaMethods[name]
+}
+
+var commonJavaMethods = map[string]bool{
+	// Object
+	"toString": true, "equals": true, "hashCode": true, "getClass": true,
+	"clone": true, "wait": true, "notify": true, "notifyAll": true,
+	// Collection / Map
+	"add": true, "remove": true, "contains": true, "clear": true,
+	"size": true, "isEmpty": true, "get": true, "put": true,
+	"iterator": true, "forEach": true, "containsKey": true, "containsValue": true,
+	"entrySet": true, "keySet": true, "values": true, "addAll": true,
+	"removeAll": true, "retainAll": true, "toArray": true, "indexOf": true,
+	"set": true, "subList": true,
+	// Stream / functional
+	"stream": true, "collect": true, "map": true, "filter": true,
+	"flatMap": true, "reduce": true, "sorted": true, "distinct": true,
+	"limit": true, "skip": true, "toList": true, "of": true,
+	"anyMatch": true, "allMatch": true, "noneMatch": true, "findFirst": true,
+	"findAny": true, "count": true, "min": true, "max": true,
+	"peek": true, "mapToInt": true, "mapToLong": true, "mapToDouble": true,
+	// I/O and logging
+	"println": true, "print": true, "printf": true,
+	"log": true, "info": true, "warn": true, "error": true, "debug": true, "trace": true,
+	"close": true, "flush": true, "read": true, "write": true, "append": true,
+	// String
+	"length": true, "charAt": true, "substring": true, "trim": true,
+	"valueOf": true, "format": true, "concat": true, "replace": true,
+	"split": true, "startsWith": true, "endsWith": true, "matches": true,
+	"toLowerCase": true, "toUpperCase": true, "strip": true, "isBlank": true,
+	// JDBC (already handled by extractJDBCRefs)
+	"prepareStatement": true, "prepareCall": true,
+	"executeQuery": true, "executeUpdate": true, "execute": true,
+	"getConnection": true, "setString": true, "setInt": true, "setLong": true,
+	"getInt": true, "getString": true, "getLong": true, "getBoolean": true,
+	"next": true, "getResultSet": true,
+	// Optional
+	"orElse": true, "orElseThrow": true, "orElseGet": true,
+	"isPresent": true, "ifPresent": true, "empty": true,
+	// Builder / common patterns
+	"build": true, "builder": true, "with": true,
+	"getLogger": true, "getName": true, "getMessage": true,
+}
+
+// extractMethodCalls walks the AST for method_invocation nodes and emits
+// "calls" references for non-trivial method calls.
+func extractMethodCalls(root *sitter.Node, src []byte, symbols []parser.Symbol) []parser.RawReference {
+	var refs []parser.RawReference
+
+	walkTree(root, func(node *sitter.Node) {
+		if node.Type() != "method_invocation" {
+			return
+		}
+
+		// Extract called method name — last identifier child before argument_list.
+		methodName := ""
+		for i := 0; i < int(node.ChildCount()); i++ {
+			child := node.Child(i)
+			if child.Type() == "identifier" {
+				methodName = child.Content(src)
+			}
+		}
+		if methodName == "" || isCommonJavaMethod(methodName) {
+			return
+		}
+
+		line := int(node.StartPoint().Row) + 1
+		from := findEnclosingSymbol(line, symbols)
+		if from == "" {
+			return
+		}
+
+		refs = append(refs, parser.RawReference{
+			FromSymbol:    from,
+			ToName:        methodName,
+			ReferenceType: "calls",
+			Confidence:    0.8,
+			Line:          line,
+		})
+	})
+
+	return refs
 }

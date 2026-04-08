@@ -295,3 +295,145 @@ func endpointKeys(m map[string]parser.Symbol) []string {
 	}
 	return keys
 }
+
+// ---------------------------------------------------------------------------
+// Nested class support tests
+// ---------------------------------------------------------------------------
+
+func TestNestedInnerClass(t *testing.T) {
+	src := `
+package com.example;
+
+public class Outer {
+    public void outerMethod() {}
+
+    public static class Inner {
+        public void innerMethod() {}
+    }
+
+    public interface Callback {
+    }
+
+    public enum Status {
+        ACTIVE, INACTIVE
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "Outer.java", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertHasSymbol(t, result.Symbols, "com.example.Outer", "class")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.outerMethod", "method")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.Inner", "class")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.Inner.innerMethod", "method")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.Callback", "interface")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.Status", "enum")
+}
+
+func TestDeeplyNestedClass(t *testing.T) {
+	src := `
+package com.example;
+
+public class Outer {
+    public static class Middle {
+        public static class Inner {
+            public void deepMethod() {}
+        }
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "Outer.java", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertHasSymbol(t, result.Symbols, "com.example.Outer", "class")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.Middle", "class")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.Middle.Inner", "class")
+	assertHasSymbol(t, result.Symbols, "com.example.Outer.Middle.Inner.deepMethod", "method")
+}
+
+// ---------------------------------------------------------------------------
+// Method call extraction tests
+// ---------------------------------------------------------------------------
+
+func TestMethodCallExtraction(t *testing.T) {
+	src := `
+package com.example;
+
+public class OrderService {
+    public void processOrder(Order order) {
+        validate(order);
+        orderRepository.save(order);
+        notificationService.sendConfirmation(order);
+        System.out.println("done");
+    }
+
+    private void validate(Order order) {
+        order.toString();
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "OrderService.java", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(result.References, "calls")
+
+	// Should include non-trivial calls
+	assertRefTarget(t, callRefs, "validate")
+	assertRefTarget(t, callRefs, "save")
+	assertRefTarget(t, callRefs, "sendConfirmation")
+
+	// Should NOT include common methods
+	for _, r := range callRefs {
+		if r.ToName == "println" || r.ToName == "toString" {
+			t.Errorf("common method %q should be filtered from call refs", r.ToName)
+		}
+	}
+
+	// Verify FromSymbol is the enclosing method
+	for _, r := range callRefs {
+		if r.ToName == "validate" && r.FromSymbol != "com.example.OrderService.processOrder" {
+			t.Errorf("expected FromSymbol com.example.OrderService.processOrder, got %s", r.FromSymbol)
+		}
+	}
+}
+
+func TestMethodCallSkipsJDBC(t *testing.T) {
+	src := `
+package com.example;
+
+public class UserDao {
+    public void getUser() {
+        conn.prepareStatement("SELECT * FROM users");
+        helper.doSomething();
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "UserDao.java", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(result.References, "calls")
+	assertRefTarget(t, callRefs, "doSomething")
+
+	// prepareStatement should NOT appear in calls (filtered + handled by JDBC)
+	for _, r := range callRefs {
+		if r.ToName == "prepareStatement" {
+			t.Error("prepareStatement should not appear in calls refs")
+		}
+	}
+
+	// JDBC detection should still produce uses_table
+	tableRefs := filterRefs(result.References, "uses_table")
+	assertRefTarget(t, tableRefs, "users")
+}
