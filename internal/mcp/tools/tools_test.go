@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"testing"
 
 	"github.com/maraichr/lattice/internal/mcp"
@@ -291,7 +292,7 @@ func TestAgentToolCatalog_ExcludesAskCodebase(t *testing.T) {
 
 func TestDispatchToolCall_UnknownTool(t *testing.T) {
 	h := &AskCodebaseHandler{}
-	result := h.dispatchToolCall(nil, "nonexistent_tool", `{}`, "test-project")
+	result := h.dispatchToolCall(context.TODO(), "nonexistent_tool", `{}`, "test-project")
 	if !contains(result, "Unknown tool") {
 		t.Errorf("expected 'Unknown tool' error, got %q", result)
 	}
@@ -299,7 +300,7 @@ func TestDispatchToolCall_UnknownTool(t *testing.T) {
 
 func TestDispatchToolCall_InvalidJSON(t *testing.T) {
 	h := &AskCodebaseHandler{}
-	result := h.dispatchToolCall(nil, "search_symbols", `{invalid`, "test-project")
+	result := h.dispatchToolCall(context.TODO(), "search_symbols", `{invalid`, "test-project")
 	if !contains(result, "Error parsing") {
 		t.Errorf("expected parsing error, got %q", result)
 	}
