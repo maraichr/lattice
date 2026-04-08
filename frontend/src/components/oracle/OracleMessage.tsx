@@ -1,7 +1,8 @@
+import type { OracleMessage as OracleMessageType } from "../../stores/oracle";
 import { Skeleton } from "../ui/skeleton";
+import { TextBlock } from "./blocks/TextBlock";
 import { OracleBlockRenderer } from "./OracleBlockRenderer";
 import { OracleHints } from "./OracleHints";
-import type { OracleMessage as OracleMessageType } from "../../stores/oracle";
 
 interface Props {
   message: OracleMessageType;
@@ -30,10 +31,11 @@ export function OracleMessage({ message, onHintClick }: Props) {
     );
   }
 
+  // Content-only response (LLM agent path or error)
   if (message.content && !message.blocks?.length) {
     return (
-      <div className="rounded-xl rounded-bl-sm bg-muted/60 px-3.5 py-2.5 text-sm text-destructive">
-        {message.content}
+      <div className="rounded-xl rounded-bl-sm bg-muted/60 px-3.5 py-2.5">
+        <TextBlock data={{ content: message.content }} />
       </div>
     );
   }
@@ -44,7 +46,9 @@ export function OracleMessage({ message, onHintClick }: Props) {
         <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
           <span className="rounded bg-muted px-1.5 py-0.5 font-mono">{message.tool}</span>
           {message.meta && (
-            <span>{message.meta.shown} of {message.meta.total_results} results</span>
+            <span>
+              {message.meta.shown} of {message.meta.total_results} results
+            </span>
           )}
         </div>
       )}
