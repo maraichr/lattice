@@ -22,6 +22,9 @@ services:
     environment:
       NEO4J_AUTH: ${NEO4J_USER}/${NEO4J_PASSWORD}
       NEO4J_PLUGINS: '["apoc"]'
+      # Neo4j 2026.01+ enforces an 8-char minimum password; relax it so the
+      # project's uniform dev password (NEO4J_PASSWORD) is accepted locally.
+      NEO4J_dbms_security_auth__minimum__password__length: "1"
     ports:
       - "7474:7474"
       - "7687:7687"

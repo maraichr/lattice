@@ -45,8 +45,9 @@ func TestPersistResults_StableIDsPreserveCrossFileEdges(t *testing.T) {
 	ctx := context.Background()
 
 	proj, err := s.CreateProject(ctx, postgres.CreateProjectParams{
-		Name: "Persist Reconcile Test",
-		Slug: fmt.Sprintf("test-persist-%s", t.Name()),
+		Name:     "Persist Reconcile Test",
+		Slug:     fmt.Sprintf("test-persist-%s", t.Name()),
+		TenantID: uuid.MustParse("00000000-0000-0000-0000-000000000099"),
 	})
 	if err != nil {
 		t.Fatalf("create project: %v", err)
@@ -140,8 +141,9 @@ func TestPersistResults_ReconcileStagesDeletions(t *testing.T) {
 	ctx := context.Background()
 
 	proj, err := s.CreateProject(ctx, postgres.CreateProjectParams{
-		Name: "Persist Deletion Test",
-		Slug: fmt.Sprintf("test-persist-del-%s", t.Name()),
+		Name:     "Persist Deletion Test",
+		Slug:     fmt.Sprintf("test-persist-del-%s", t.Name()),
+		TenantID: uuid.MustParse("00000000-0000-0000-0000-000000000099"),
 	})
 	if err != nil {
 		t.Fatalf("create project: %v", err)
