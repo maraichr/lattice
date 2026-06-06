@@ -18,6 +18,12 @@ SELECT * FROM files WHERE id = $1;
 -- name: ListFilesByProject :many
 SELECT * FROM files WHERE project_id = $1;
 
+-- name: ListFilesByProjectUpdatedSince :many
+SELECT * FROM files WHERE project_id = @project_id AND updated_at >= @since;
+
+-- name: DeleteFile :exec
+DELETE FROM files WHERE id = $1;
+
 -- name: ListFilesBySourceID :many
 SELECT * FROM files WHERE source_id = $1;
 

@@ -31,7 +31,7 @@ func (s *ParseStage) Execute(ctx context.Context, rc *IndexRunContext) error {
 		return nil
 	}
 
-	// Handle incremental: delete symbols for removed files before enqueuing parse tasks.
+	// Handle incremental: remove records for deleted files before enqueuing parse tasks.
 	if rc.Incremental && len(rc.DeletedFiles) > 0 {
 		for _, delPath := range rc.DeletedFiles {
 			file, err := s.store.GetFileByPath(ctx, postgres.GetFileByPathParams{
@@ -42,7 +42,24 @@ func (s *ParseStage) Execute(ctx context.Context, rc *IndexRunContext) error {
 			if err != nil {
 				continue
 			}
-			_ = s.store.DeleteSymbolsByFileID(ctx, file.ID)
+			// Stage Neo4j pruning for the file's symbols and the file node itself,
+			// then delete the file row (cascades to symbols, edges, and embeddings).
+			symbolIDs, _ := s.store.ListSymbolIDsByFile(ctx, file.ID)
+			for _, id := range symbolIDs {
+				_ = s.store.RecordGraphDeletion(ctx, postgres.RecordGraphDeletionParams{
+					IndexRunID: rc.IndexRunID,
+					ProjectID:  rc.ProjectID,
+					NodeID:     id,
+					NodeType:   "symbol",
+				})
+			}
+			_ = s.store.RecordGraphDeletion(ctx, postgres.RecordGraphDeletionParams{
+				IndexRunID: rc.IndexRunID,
+				ProjectID:  rc.ProjectID,
+				NodeID:     file.ID,
+				NodeType:   "file",
+			})
+			_ = s.store.DeleteFile(ctx, file.ID)
 		}
 	}
 

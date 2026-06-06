@@ -50,6 +50,15 @@ type File struct {
 	UpdatedAt     time.Time          `json:"updated_at"`
 }
 
+type GraphDeletion struct {
+	ID         uuid.UUID `json:"id"`
+	IndexRunID uuid.UUID `json:"index_run_id"`
+	ProjectID  uuid.UUID `json:"project_id"`
+	NodeID     uuid.UUID `json:"node_id"`
+	NodeType   string    `json:"node_type"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
 type IndexRun struct {
 	ID             uuid.UUID          `json:"id"`
 	ProjectID      uuid.UUID          `json:"project_id"`

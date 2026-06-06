@@ -7,6 +7,7 @@ package postgres
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -20,6 +21,15 @@ func (q *Queries) CountFilesByProject(ctx context.Context, projectID uuid.UUID) 
 	var count int64
 	err := row.Scan(&count)
 	return count, err
+}
+
+const deleteFile = `-- name: DeleteFile :exec
+DELETE FROM files WHERE id = $1
+`
+
+func (q *Queries) DeleteFile(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteFile, id)
+	return err
 }
 
 const getFile = `-- name: GetFile :one
@@ -78,6 +88,46 @@ SELECT id, project_id, source_id, path, language, size_bytes, hash, last_indexed
 
 func (q *Queries) ListFilesByProject(ctx context.Context, projectID uuid.UUID) ([]File, error) {
 	rows, err := q.db.Query(ctx, listFilesByProject, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []File{}
+	for rows.Next() {
+		var i File
+		if err := rows.Scan(
+			&i.ID,
+			&i.ProjectID,
+			&i.SourceID,
+			&i.Path,
+			&i.Language,
+			&i.SizeBytes,
+			&i.Hash,
+			&i.LastIndexedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listFilesByProjectUpdatedSince = `-- name: ListFilesByProjectUpdatedSince :many
+SELECT id, project_id, source_id, path, language, size_bytes, hash, last_indexed_at, created_at, updated_at FROM files WHERE project_id = $1 AND updated_at >= $2
+`
+
+type ListFilesByProjectUpdatedSinceParams struct {
+	ProjectID uuid.UUID `json:"project_id"`
+	Since     time.Time `json:"since"`
+}
+
+func (q *Queries) ListFilesByProjectUpdatedSince(ctx context.Context, arg ListFilesByProjectUpdatedSinceParams) ([]File, error) {
+	rows, err := q.db.Query(ctx, listFilesByProjectUpdatedSince, arg.ProjectID, arg.Since)
 	if err != nil {
 		return nil, err
 	}

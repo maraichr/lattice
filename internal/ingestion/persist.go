@@ -35,10 +35,14 @@ func PersistResults(ctx context.Context, s *store.Store, indexRunID uuid.UUID, r
 		}
 		files++
 
-		// Delete existing symbols for this file (re-index).
-		_ = s.DeleteSymbolsByFile(ctx, dbFile.ID)
-
+		// Upsert symbols for this file. We deliberately avoid delete-then-insert:
+		// CreateSymbol upserts on (project_id, qualified_name, kind), so symbols that
+		// survive a re-index keep their IDs. That preserves cross-file edges and
+		// embeddings, which are FK'd to symbols ON DELETE CASCADE and would otherwise
+		// be silently dropped on every run. Symbols that no longer exist are reconciled
+		// away afterwards.
 		symbolIDs := make(map[string]uuid.UUID)
+		keepIDs := make([]uuid.UUID, 0, len(fr.Symbols))
 
 		for _, sym := range fr.Symbols {
 			created, err := createSymbol(ctx, s, fr.ProjectID, dbFile.ID, sym)
@@ -46,6 +50,7 @@ func PersistResults(ctx context.Context, s *store.Store, indexRunID uuid.UUID, r
 				return files, symbols, edges, fmt.Errorf("create symbol %s: %w", sym.QualifiedName, err)
 			}
 			symbolIDs[sym.QualifiedName] = created.ID
+			keepIDs = append(keepIDs, created.ID)
 			symbols++
 
 			for _, child := range sym.Children {
@@ -54,8 +59,28 @@ func PersistResults(ctx context.Context, s *store.Store, indexRunID uuid.UUID, r
 					return files, symbols, edges, fmt.Errorf("create child symbol %s: %w", child.QualifiedName, err)
 				}
 				symbolIDs[child.QualifiedName] = childCreated.ID
+				keepIDs = append(keepIDs, childCreated.ID)
 				symbols++
 			}
+		}
+
+		// Reconcile: drop symbols that previously belonged to this file but are no
+		// longer produced, and stage their Neo4j nodes for deletion so Postgres and
+		// Neo4j stay consistent. An empty keepIDs set deletes all of the file's symbols.
+		removed, err := s.DeleteSymbolsByFileExcept(ctx, postgres.DeleteSymbolsByFileExceptParams{
+			FileID:  dbFile.ID,
+			KeepIds: keepIDs,
+		})
+		if err != nil {
+			return files, symbols, edges, fmt.Errorf("reconcile symbols for %s: %w", fr.Path, err)
+		}
+		for _, id := range removed {
+			_ = s.RecordGraphDeletion(ctx, postgres.RecordGraphDeletionParams{
+				IndexRunID: indexRunID,
+				ProjectID:  fr.ProjectID,
+				NodeID:     id,
+				NodeType:   "symbol",
+			})
 		}
 
 		// Insert intra-file edges (best-effort: cross-file edges resolved later).

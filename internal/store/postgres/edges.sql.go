@@ -7,6 +7,7 @@ package postgres
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -197,6 +198,43 @@ SELECT id, project_id, source_id, target_id, edge_type, metadata, created_at FRO
 
 func (q *Queries) ListEdgesByProject(ctx context.Context, projectID uuid.UUID) ([]SymbolEdge, error) {
 	rows, err := q.db.Query(ctx, listEdgesByProject, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []SymbolEdge{}
+	for rows.Next() {
+		var i SymbolEdge
+		if err := rows.Scan(
+			&i.ID,
+			&i.ProjectID,
+			&i.SourceID,
+			&i.TargetID,
+			&i.EdgeType,
+			&i.Metadata,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEdgesByProjectCreatedSince = `-- name: ListEdgesByProjectCreatedSince :many
+SELECT id, project_id, source_id, target_id, edge_type, metadata, created_at FROM symbol_edges WHERE project_id = $1 AND created_at >= $2
+`
+
+type ListEdgesByProjectCreatedSinceParams struct {
+	ProjectID uuid.UUID `json:"project_id"`
+	Since     time.Time `json:"since"`
+}
+
+func (q *Queries) ListEdgesByProjectCreatedSince(ctx context.Context, arg ListEdgesByProjectCreatedSinceParams) ([]SymbolEdge, error) {
+	rows, err := q.db.Query(ctx, listEdgesByProjectCreatedSince, arg.ProjectID, arg.Since)
 	if err != nil {
 		return nil, err
 	}

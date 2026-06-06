@@ -54,6 +54,20 @@ MATCH (n {projectId: $projectId})
 DETACH DELETE n
 `
 
+	// DeleteSymbolNodesByID removes symbol nodes (and their relationships) by ID.
+	DeleteSymbolNodesByID = `
+UNWIND $ids AS id
+MATCH (s:Symbol {id: id})
+DETACH DELETE s
+`
+
+	// DeleteFileNodesByID removes file nodes (and their relationships) by ID.
+	DeleteFileNodesByID = `
+UNWIND $ids AS id
+MATCH (f:File {id: id})
+DETACH DELETE f
+`
+
 	// LineageUpstream finds all upstream dependencies of a symbol.
 	LineageUpstream = `
 MATCH path = (upstream)-[:DEPENDS_ON*1..%d]->(target:Symbol {id: $symbolId})
