@@ -16,6 +16,9 @@ SELECT * FROM symbol_edges WHERE source_id = $1;
 -- name: ListEdgesByProject :many
 SELECT * FROM symbol_edges WHERE project_id = $1;
 
+-- name: ListEdgesByProjectCreatedSince :many
+SELECT * FROM symbol_edges WHERE project_id = @project_id AND created_at >= @since;
+
 -- name: CreateSymbolEdgeWithMetadata :one
 INSERT INTO symbol_edges (project_id, source_id, target_id, edge_type, metadata)
 VALUES ($1, $2, $3, $4, $5)

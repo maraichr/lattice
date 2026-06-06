@@ -92,22 +92,40 @@ func (q *Queries) CreateSymbol(ctx context.Context, arg CreateSymbolParams) (Sym
 	return i, err
 }
 
-const deleteSymbolsByFile = `-- name: DeleteSymbolsByFile :exec
-DELETE FROM symbols WHERE file_id = $1
+const deleteSymbolsByFileExcept = `-- name: DeleteSymbolsByFileExcept :many
+DELETE FROM symbols
+WHERE file_id = $1 AND id <> ALL($2::uuid[])
+RETURNING id
 `
 
-func (q *Queries) DeleteSymbolsByFile(ctx context.Context, fileID uuid.UUID) error {
-	_, err := q.db.Exec(ctx, deleteSymbolsByFile, fileID)
-	return err
+type DeleteSymbolsByFileExceptParams struct {
+	FileID  uuid.UUID   `json:"file_id"`
+	KeepIds []uuid.UUID `json:"keep_ids"`
 }
 
-const deleteSymbolsByFileID = `-- name: DeleteSymbolsByFileID :exec
-DELETE FROM symbols WHERE file_id = $1
-`
-
-func (q *Queries) DeleteSymbolsByFileID(ctx context.Context, fileID uuid.UUID) error {
-	_, err := q.db.Exec(ctx, deleteSymbolsByFileID, fileID)
-	return err
+// DeleteSymbolsByFileExcept removes symbols that previously belonged to a file but
+// are no longer produced by the latest parse, while leaving surviving symbols (and
+// therefore their IDs, cross-file edges, and embeddings) untouched. An empty keep_ids
+// array deletes every symbol for the file. Returns the deleted IDs so the caller can
+// stage the corresponding Neo4j node deletions.
+func (q *Queries) DeleteSymbolsByFileExcept(ctx context.Context, arg DeleteSymbolsByFileExceptParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, deleteSymbolsByFileExcept, arg.FileID, arg.KeepIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getSymbol = `-- name: GetSymbol :one
@@ -259,6 +277,30 @@ func (q *Queries) ListColumnSymbolsByProject(ctx context.Context, projectID uuid
 	return items, nil
 }
 
+const listSymbolIDsByFile = `-- name: ListSymbolIDsByFile :many
+SELECT id FROM symbols WHERE file_id = $1
+`
+
+func (q *Queries) ListSymbolIDsByFile(ctx context.Context, fileID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listSymbolIDsByFile, fileID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSymbolsByFileIDs = `-- name: ListSymbolsByFileIDs :many
 SELECT id, project_id, file_id, name, qualified_name, kind, language, start_line, end_line, start_col, end_col, signature, doc_comment, metadata, created_at, updated_at FROM symbols WHERE file_id = ANY($1::uuid[])
 `
@@ -352,6 +394,52 @@ SELECT id, project_id, file_id, name, qualified_name, kind, language, start_line
 
 func (q *Queries) ListSymbolsByProject(ctx context.Context, projectID uuid.UUID) ([]Symbol, error) {
 	rows, err := q.db.Query(ctx, listSymbolsByProject, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Symbol{}
+	for rows.Next() {
+		var i Symbol
+		if err := rows.Scan(
+			&i.ID,
+			&i.ProjectID,
+			&i.FileID,
+			&i.Name,
+			&i.QualifiedName,
+			&i.Kind,
+			&i.Language,
+			&i.StartLine,
+			&i.EndLine,
+			&i.StartCol,
+			&i.EndCol,
+			&i.Signature,
+			&i.DocComment,
+			&i.Metadata,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSymbolsByProjectUpdatedSince = `-- name: ListSymbolsByProjectUpdatedSince :many
+SELECT id, project_id, file_id, name, qualified_name, kind, language, start_line, end_line, start_col, end_col, signature, doc_comment, metadata, created_at, updated_at FROM symbols WHERE project_id = $1 AND updated_at >= $2
+`
+
+type ListSymbolsByProjectUpdatedSinceParams struct {
+	ProjectID uuid.UUID `json:"project_id"`
+	Since     time.Time `json:"since"`
+}
+
+func (q *Queries) ListSymbolsByProjectUpdatedSince(ctx context.Context, arg ListSymbolsByProjectUpdatedSinceParams) ([]Symbol, error) {
+	rows, err := q.db.Query(ctx, listSymbolsByProjectUpdatedSince, arg.ProjectID, arg.Since)
 	if err != nil {
 		return nil, err
 	}

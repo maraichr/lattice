@@ -17,8 +17,21 @@ RETURNING *;
 -- name: CountSymbolsByProject :one
 SELECT count(*) FROM symbols WHERE project_id = $1;
 
--- name: DeleteSymbolsByFile :exec
-DELETE FROM symbols WHERE file_id = $1;
+-- DeleteSymbolsByFileExcept removes symbols that previously belonged to a file but
+-- are no longer produced by the latest parse, while leaving surviving symbols (and
+-- therefore their IDs, cross-file edges, and embeddings) untouched. An empty keep_ids
+-- array deletes every symbol for the file. Returns the deleted IDs so the caller can
+-- stage the corresponding Neo4j node deletions.
+-- name: DeleteSymbolsByFileExcept :many
+DELETE FROM symbols
+WHERE file_id = @file_id AND id <> ALL(@keep_ids::uuid[])
+RETURNING id;
+
+-- name: ListSymbolIDsByFile :many
+SELECT id FROM symbols WHERE file_id = $1;
+
+-- name: ListSymbolsByProjectUpdatedSince :many
+SELECT * FROM symbols WHERE project_id = @project_id AND updated_at >= @since;
 
 -- name: GetSymbol :one
 SELECT * FROM symbols WHERE id = $1;
@@ -46,9 +59,6 @@ SELECT * FROM symbols WHERE project_id = $1 AND qualified_name = $2;
 
 -- name: ListSymbolsByNames :many
 SELECT * FROM symbols WHERE project_id = $1 AND name = ANY($2::text[]);
-
--- name: DeleteSymbolsByFileID :exec
-DELETE FROM symbols WHERE file_id = $1;
 
 -- name: ListColumnSymbolsByProject :many
 SELECT * FROM symbols WHERE project_id = $1 AND kind = 'column';

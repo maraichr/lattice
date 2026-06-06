@@ -62,14 +62,22 @@ func (c *Client) SyncEdges(ctx context.Context, projectID uuid.UUID, edges []pos
 		end := min(i+batchSize, len(edges))
 		batch := edges[i:end]
 
-		params := make([]map[string]any, len(batch))
-		for j, edge := range batch {
-			params[j] = map[string]any{
+		params := make([]map[string]any, 0, len(batch))
+		for _, edge := range batch {
+			// Column-level edges are represented as COLUMN_FLOW by SyncColumnEdges;
+			// excluding them here keeps DEPENDS_ON traversals (lineage/impact) clean.
+			if isColumnEdgeType(edge.EdgeType) {
+				continue
+			}
+			params = append(params, map[string]any{
 				"sourceId":  edge.SourceID.String(),
 				"targetId":  edge.TargetID.String(),
 				"edgeType":  edge.EdgeType,
 				"projectId": projectID.String(),
-			}
+			})
+		}
+		if len(params) == 0 {
+			continue
 		}
 
 		_, err := neo4j.ExecuteWrite(ctx, session, func(tx neo4j.ManagedTransaction) (any, error) {
@@ -122,7 +130,7 @@ func (c *Client) SyncColumnEdges(ctx context.Context, projectID uuid.UUID, edges
 	// Filter to column-level edge types
 	var colEdges []postgres.SymbolEdge
 	for _, e := range edges {
-		if e.EdgeType == "transforms_to" || e.EdgeType == "direct_copy" || e.EdgeType == "uses_column" {
+		if isColumnEdgeType(e.EdgeType) {
 			colEdges = append(colEdges, e)
 		}
 	}
@@ -159,6 +167,44 @@ func (c *Client) SyncColumnEdges(ctx context.Context, projectID uuid.UUID, edges
 		})
 		if err != nil {
 			return fmt.Errorf("sync column edges batch %d: %w", i/batchSize, err)
+		}
+	}
+	return nil
+}
+
+// isColumnEdgeType reports whether an edge type is a column-level lineage edge,
+// which is represented in Neo4j as COLUMN_FLOW rather than DEPENDS_ON.
+func isColumnEdgeType(t string) bool {
+	return t == "transforms_to" || t == "direct_copy" || t == "uses_column"
+}
+
+// DeleteSymbolNodes removes symbol nodes (and their relationships) from Neo4j by ID.
+func (c *Client) DeleteSymbolNodes(ctx context.Context, ids []string) error {
+	return c.deleteNodesByID(ctx, DeleteSymbolNodesByID, ids)
+}
+
+// DeleteFileNodes removes file nodes (and their relationships) from Neo4j by ID.
+func (c *Client) DeleteFileNodes(ctx context.Context, ids []string) error {
+	return c.deleteNodesByID(ctx, DeleteFileNodesByID, ids)
+}
+
+func (c *Client) deleteNodesByID(ctx context.Context, query string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	session := c.Session(ctx)
+	defer session.Close(ctx)
+
+	for i := 0; i < len(ids); i += batchSize {
+		end := min(i+batchSize, len(ids))
+		batch := ids[i:end]
+
+		_, err := neo4j.ExecuteWrite(ctx, session, func(tx neo4j.ManagedTransaction) (any, error) {
+			_, err := tx.Run(ctx, query, map[string]any{"ids": batch})
+			return struct{}{}, err
+		})
+		if err != nil {
+			return fmt.Errorf("delete nodes batch %d: %w", i/batchSize, err)
 		}
 	}
 	return nil
