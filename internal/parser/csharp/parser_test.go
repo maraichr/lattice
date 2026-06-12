@@ -478,6 +478,108 @@ namespace MyApp {
 	assertRefTarget(t, callRefs, "GetAllUsers")
 }
 
+func TestLegacyAdoCommandTypes(t *testing.T) {
+	// .NET Framework-era apps commonly use OleDb/Odbc providers and DataAdapters
+	src := `
+using System.Data.OleDb;
+namespace Legacy {
+    public class Repo {
+        public void Load() {
+            var cmd = new OleDbCommand("GetOrders", conn);
+            var da = new SqlDataAdapter("SELECT * FROM Products", conn);
+            var qcmd = new System.Data.SqlClient.SqlCommand("ArchiveOrders", conn);
+        }
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "Repo.cs", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(result.References, "calls")
+	assertRefTarget(t, callRefs, "GetOrders")
+	assertRefTarget(t, callRefs, "ArchiveOrders")
+
+	tableRefs := filterRefs(result.References, "uses_table")
+	assertRefTarget(t, tableRefs, "Products")
+}
+
+func TestSQLInLocalVariable(t *testing.T) {
+	// SQL built in a string variable and assigned to CommandText later
+	src := `
+namespace Legacy {
+    public class Repo {
+        public void Load(int id) {
+            string sql = "SELECT * FROM Customers WHERE Id = " + id;
+            sql += " ORDER BY Name";
+            cmd.CommandText = sql;
+        }
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "Repo.cs", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tableRefs := filterRefs(result.References, "uses_table")
+	assertRefTarget(t, tableRefs, "Customers")
+
+	// The bare identifier assignment to CommandText must not produce a calls ref
+	callRefs := filterRefs(result.References, "calls")
+	if len(callRefs) != 0 {
+		t.Errorf("expected 0 calls refs, got %d: %v", len(callRefs), refsToNames(callRefs))
+	}
+}
+
+func TestSQLVariableConcatenation(t *testing.T) {
+	src := `
+namespace Legacy {
+    public class Repo {
+        public void Load() {
+            string sql = "SELECT o.OrderID, o.Total " +
+                "FROM Orders o " +
+                "INNER JOIN Customers c ON c.CustomerID = o.CustomerID";
+        }
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "Repo.cs", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tableRefs := filterRefs(result.References, "uses_table")
+	assertRefTarget(t, tableRefs, "Orders")
+	assertRefTarget(t, tableRefs, "Customers")
+}
+
+func TestNonSQLStringVariableIgnored(t *testing.T) {
+	src := `
+namespace Legacy {
+    public class Repo {
+        public void Load() {
+            string msg = "Loaded all records from the cache";
+        }
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "Repo.cs", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tableRefs := filterRefs(result.References, "uses_table")
+	if len(tableRefs) != 0 {
+		t.Errorf("expected 0 table refs for UI string, got %v", refsToNames(tableRefs))
+	}
+}
+
 func TestExecInInlineSQL(t *testing.T) {
 	src := `
 namespace MyApp {

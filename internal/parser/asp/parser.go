@@ -28,8 +28,22 @@ func (p *Parser) Parse(input parser.FileInput) (*parser.ParseResult, error) {
 	dirRefs := extractDirectives(content)
 	refs = append(refs, dirRefs...)
 
-	// Extract VBScript regions from <% ... %>
+	// Data-bound control commands in markup, e.g. <asp:SqlDataSource SelectCommand="...">
+	refs = append(refs, extractDataSourceCommands(content)...)
+
+	// Extract code regions: <% ... %> and <script runat="server"> blocks
 	regions := extractScriptRegions(content)
+	regions = append(regions, extractServerScriptRegions(content)...)
+
+	// .ashx WebHandler files: everything after the directive is raw C#/VB.NET code
+	var fileScopeSyms []parser.Symbol
+	if whRegion, whSym, ok := extractWebHandler(content); ok {
+		if whSym != nil {
+			fileScopeSyms = append(fileScopeSyms, *whSym)
+			symbols = append(symbols, *whSym)
+		}
+		regions = append(regions, whRegion)
+	}
 
 	for _, region := range regions {
 		// Parse VBScript constructs
@@ -37,17 +51,39 @@ func (p *Parser) Parse(input parser.FileInput) (*parser.ParseResult, error) {
 		symbols = append(symbols, syms...)
 		refs = append(refs, rfs...)
 
+		// Candidates for enclosing-scope attribution: this region's symbols plus
+		// file-spanning ones (e.g. the WebHandler class).
+		candidates := make([]parser.Symbol, 0, len(syms)+len(fileScopeSyms))
+		candidates = append(candidates, syms...)
+		candidates = append(candidates, fileScopeSyms...)
+
 		// Extract embedded SQL from ADO patterns; set FromSymbol to enclosing function/sub for cross-language resolution
 		sqlFragments := ExtractSQL(region.code)
 		for _, frag := range sqlFragments {
-			sqlRefs := extractSQLRefs(frag.SQL, frag.Line+region.startLine)
-			line := frag.Line + region.startLine
-			fromSymbol := enclosingSymbol(line, syms)
+			line := region.startLine + frag.Line - 1
+			sqlRefs := extractSQLRefs(frag.SQL, line)
+			fromSymbol := enclosingSymbol(line, candidates)
 			for i := range sqlRefs {
 				sqlRefs[i].FromSymbol = fromSymbol
 				sqlRefs[i].ToQualified = "dbo." + sqlRefs[i].ToName
+				if sqlRefs[i].Confidence == 0 {
+					sqlRefs[i].Confidence = frag.Confidence
+				}
 			}
 			refs = append(refs, sqlRefs...)
+		}
+
+		// Stored procedures invoked by name, e.g. cmd.CommandText = "GetUsers"
+		for _, pc := range ExtractProcCalls(region.code) {
+			line := region.startLine + pc.Line - 1
+			name := strings.TrimPrefix(pc.Name, "dbo.")
+			refs = append(refs, parser.RawReference{
+				FromSymbol:    enclosingSymbol(line, candidates),
+				ToName:        name,
+				ToQualified:   "dbo." + name,
+				ReferenceType: "calls",
+				Line:          line,
+			})
 		}
 	}
 
@@ -82,6 +118,87 @@ func extractScriptRegions(content string) []scriptRegion {
 	return regions
 }
 
+// serverScriptRe matches <script runat="server"> blocks used by both classic
+// ASP and ASP.NET WebForms pages for server-side code (VBScript, VB.NET, or C#).
+var serverScriptRe = regexp.MustCompile(`(?is)<script\b[^>]*\brunat\s*=\s*"?server"?[^>]*>(.*?)</script>`)
+
+func extractServerScriptRegions(content string) []scriptRegion {
+	var regions []scriptRegion
+	for _, loc := range serverScriptRe.FindAllStringSubmatchIndex(content, -1) {
+		code := content[loc[2]:loc[3]]
+		startLine := strings.Count(content[:loc[2]], "\n") + 1
+		regions = append(regions, scriptRegion{code: code, startLine: startLine})
+	}
+	return regions
+}
+
+// webHandlerRe matches the <%@ WebHandler %> directive that starts .ashx files.
+var webHandlerRe = regexp.MustCompile(`(?i)<%@\s*WebHandler\b[^%]*%>`)
+
+// extractWebHandler treats the body of an .ashx file (everything after the
+// <%@ WebHandler %> directive) as a code region, and emits a class symbol for
+// the handler so embedded SQL references have an enclosing scope.
+func extractWebHandler(content string) (scriptRegion, *parser.Symbol, bool) {
+	loc := webHandlerRe.FindStringIndex(content)
+	if loc == nil {
+		return scriptRegion{}, nil, false
+	}
+
+	directive := content[loc[0]:loc[1]]
+	code := content[loc[1]:]
+	startLine := strings.Count(content[:loc[1]], "\n") + 1
+
+	var sym *parser.Symbol
+	if cls := extractAttrValue(directive, "Class"); cls != "" {
+		name := cls
+		if idx := strings.LastIndex(cls, "."); idx >= 0 {
+			name = cls[idx+1:]
+		}
+		sym = &parser.Symbol{
+			Name:          name,
+			QualifiedName: cls,
+			Kind:          "class",
+			Language:      "asp",
+			StartLine:     1,
+			EndLine:       strings.Count(content, "\n") + 1,
+		}
+	}
+
+	return scriptRegion{code: code, startLine: startLine}, sym, true
+}
+
+// dataSourceCmdRe matches SQL command attributes on data-bound WebForms
+// controls, e.g. <asp:SqlDataSource SelectCommand="SELECT ..." UpdateCommand="...">.
+var dataSourceCmdRe = regexp.MustCompile(`(?i)\b(?:Select|Insert|Update|Delete)Command\s*=\s*"([^"]+)"`)
+
+func extractDataSourceCommands(content string) []parser.RawReference {
+	var refs []parser.RawReference
+	for _, loc := range dataSourceCmdRe.FindAllStringSubmatchIndex(content, -1) {
+		val := content[loc[2]:loc[3]]
+		line := strings.Count(content[:loc[0]], "\n") + 1
+		if looksLikeSQL(val) {
+			sqlRefs := extractSQLRefs(val, line)
+			for i := range sqlRefs {
+				sqlRefs[i].ToQualified = "dbo." + sqlRefs[i].ToName
+				if sqlRefs[i].Confidence == 0 {
+					sqlRefs[i].Confidence = 0.9
+				}
+			}
+			refs = append(refs, sqlRefs...)
+		} else if procNameRe.MatchString(val) {
+			// SelectCommandType="StoredProcedure" form: the command is a proc name
+			name := strings.TrimPrefix(val, "dbo.")
+			refs = append(refs, parser.RawReference{
+				ToName:        name,
+				ToQualified:   "dbo." + name,
+				ReferenceType: "calls",
+				Line:          line,
+			})
+		}
+	}
+	return refs
+}
+
 func parseVBScript(code string, baseOffset int) ([]parser.Symbol, []parser.RawReference) {
 	var symbols []parser.Symbol
 	var refs []parser.RawReference
@@ -103,7 +220,7 @@ func parseVBScript(code string, baseOffset int) ([]parser.Symbol, []parser.RawRe
 					Kind:          "function",
 					Language:      "asp",
 					StartLine:     lineNum,
-					EndLine:       findEndLine(lines, i, "function"),
+					EndLine:       findEndLine(lines, i, "function", baseOffset),
 					Signature:     sig,
 				})
 			}
@@ -119,7 +236,7 @@ func parseVBScript(code string, baseOffset int) ([]parser.Symbol, []parser.RawRe
 					Kind:          "procedure",
 					Language:      "asp",
 					StartLine:     lineNum,
-					EndLine:       findEndLine(lines, i, "sub"),
+					EndLine:       findEndLine(lines, i, "sub", baseOffset),
 					Signature:     sig,
 				})
 			}
@@ -136,7 +253,7 @@ func parseVBScript(code string, baseOffset int) ([]parser.Symbol, []parser.RawRe
 					Kind:          "class",
 					Language:      "asp",
 					StartLine:     lineNum,
-					EndLine:       findEndLine(lines, i, "class"),
+					EndLine:       findEndLine(lines, i, "class", baseOffset),
 				})
 			}
 		}
@@ -219,14 +336,16 @@ func parseConstDecl(line string) string {
 	return ""
 }
 
-func findEndLine(lines []string, startIdx int, kind string) int {
+// findEndLine returns the absolute line of the matching "End <kind>" statement.
+// baseOffset is the absolute line number of lines[0].
+func findEndLine(lines []string, startIdx int, kind string, baseOffset int) int {
 	endKW := "end " + kind
 	for i := startIdx + 1; i < len(lines); i++ {
 		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(lines[i])), endKW) {
-			return i + 1
+			return baseOffset + i
 		}
 	}
-	return startIdx + 1
+	return baseOffset + startIdx
 }
 
 // enclosingSymbol returns the qualified name of the innermost symbol (function/sub/class) that contains the given line.
