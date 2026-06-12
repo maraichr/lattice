@@ -42,8 +42,9 @@ func seedTestGraph(t *testing.T, s *store.Store) (projectID uuid.UUID, cleanup f
 	slug := fmt.Sprintf("test-analytics-%s", t.Name())
 
 	proj, err := s.CreateProject(ctx, postgres.CreateProjectParams{
-		Name: "Test Analytics Project",
-		Slug: slug,
+		Name:     "Test Analytics Project",
+		Slug:     slug,
+		TenantID: uuid.MustParse("00000000-0000-0000-0000-000000000099"),
 	})
 	if err != nil {
 		t.Fatalf("create project: %v", err)
