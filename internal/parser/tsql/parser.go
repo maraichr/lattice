@@ -16,6 +16,17 @@ type Parser struct {
 	schema           string // current default schema
 	skipColumnLineage bool  // when true, do not extract column-level lineage (migration/schema files)
 	fileContext       string // synthetic context for top-level statements (e.g. "__file__:migrate")
+	cteNames          map[string]bool // lowercased CTE names declared in this batch (not real tables)
+}
+
+// stmtStartKeywords are keywords that can only begin a new statement when seen
+// at the top level of a statement tail. T-SQL does not require semicolon
+// terminators, so these mark statement boundaries.
+var stmtStartKeywords = map[string]bool{
+	"SELECT": true, "INSERT": true, "UPDATE": true, "DELETE": true,
+	"EXEC": true, "EXECUTE": true, "MERGE": true, "CREATE": true,
+	"ALTER": true, "DROP": true, "DECLARE": true, "SET": true,
+	"IF": true, "ELSE": true, "WHILE": true, "RETURN": true, "BEGIN": true,
 }
 
 // TSQLParser implements the parser.Parser interface.
@@ -51,6 +62,7 @@ func (t *TSQLParser) Parse(input parser.FileInput) (*parser.ParseResult, error) 
 			schema:            "dbo",
 			skipColumnLineage: input.SkipColumnLineage,
 			fileContext:       syntheticContext,
+			cteNames:          make(map[string]bool),
 		}
 		p.parseBatch()
 		allSymbols = append(allSymbols, p.symbols...)
@@ -119,10 +131,10 @@ func (p *Parser) parseBatch() {
 	// Use fileContext for top-level statements so EXEC/DML outside procedures
 	// can still generate edges. A synthetic __file__ symbol is emitted if needed.
 	ctx := p.fileContext
-	emittedFileSymbol := false
+	fileSymIdx := -1
 
 	ensureFileSymbol := func() {
-		if ctx != "" && !emittedFileSymbol {
+		if ctx != "" && fileSymIdx == -1 {
 			p.symbols = append(p.symbols, parser.Symbol{
 				Name:          ctx,
 				QualifiedName: ctx,
@@ -131,7 +143,7 @@ func (p *Parser) parseBatch() {
 				StartLine:     1,
 				EndLine:       p.currentLine(),
 			})
-			emittedFileSymbol = true
+			fileSymIdx = len(p.symbols) - 1
 		}
 	}
 
@@ -146,24 +158,37 @@ func (p *Parser) parseBatch() {
 			case "CREATE":
 				p.parseCreate()
 			case "SELECT":
+				ensureFileSymbol()
 				p.parseSelect(ctx)
 			case "INSERT":
+				ensureFileSymbol()
 				p.parseInsert(ctx)
 			case "UPDATE":
+				ensureFileSymbol()
 				p.parseUpdate(ctx)
 			case "DELETE":
+				ensureFileSymbol()
 				p.parseDelete(ctx)
 			case "EXEC", "EXECUTE":
 				ensureFileSymbol()
 				p.parseExec(ctx)
 			case "MERGE":
+				ensureFileSymbol()
 				p.parseMerge(ctx)
+			case "WITH":
+				ensureFileSymbol()
+				p.parseWith(ctx)
 			default:
 				p.advance()
 			}
 		} else {
 			p.advance()
 		}
+	}
+
+	// Extend the script symbol to cover the whole batch.
+	if fileSymIdx >= 0 {
+		p.symbols[fileSymIdx].EndLine = p.currentLine()
 	}
 }
 
@@ -304,6 +329,9 @@ func (p *Parser) parseCreateView(startLine int) {
 	if p.matchKeyword("AS") {
 		p.advance()
 		colRefsBefore := len(p.colRefs)
+		if p.matchKeyword("WITH") {
+			p.parseWith(name)
+		}
 		p.parseSelect(name)
 
 		// Create column children for the view from the SELECT output columns.
@@ -473,6 +501,7 @@ func (p *Parser) parseCreateType(startLine int) {
 // parseBody parses the body of a procedure/function/trigger, extracting DML references.
 func (p *Parser) parseBody(context string) {
 	depth := 0
+	caseDepth := 0
 	for p.pos < len(p.tokens) {
 		tok := p.current()
 		if tok.Type == TokenEOF {
@@ -484,7 +513,17 @@ func (p *Parser) parseBody(context string) {
 			case "BEGIN":
 				depth++
 				p.advance()
+			case "CASE":
+				// CASE...END inside the body (e.g. SET @x = CASE ... END) must not
+				// be confused with a block-closing END.
+				caseDepth++
+				p.advance()
 			case "END":
+				if caseDepth > 0 {
+					caseDepth--
+					p.advance()
+					continue
+				}
 				if depth > 0 {
 					depth--
 				}
@@ -492,6 +531,8 @@ func (p *Parser) parseBody(context string) {
 				if depth == 0 {
 					return
 				}
+			case "WITH":
+				p.parseWith(context)
 			case "SELECT":
 				p.parseSelect(context)
 			case "INSERT":
@@ -527,8 +568,46 @@ func (p *Parser) parseSelect(context string) {
 		fromTables = p.collectFromTables(context, "reads_from")
 	}
 
-	// Process JOINs — also collect table aliases
-	for p.pos < len(p.tokens) && !p.matchPunct(";") && !p.matchKeyword("UNION") {
+	// Process JOINs — also collect table aliases. Stop at statement boundaries:
+	// semicolon, set operators, a closing paren belonging to an enclosing
+	// construct (subquery/CTE body), or a keyword that can only start the next
+	// statement — T-SQL does not require semicolon terminators.
+	caseDepth := 0
+	for p.pos < len(p.tokens) {
+		tok := p.current()
+		if tok.Type == TokenEOF || p.matchPunct(";") || p.matchKeyword("UNION") {
+			break
+		}
+		if p.matchPunct(")") {
+			break // unmatched close paren: belongs to an enclosing construct
+		}
+		if tok.Type == TokenKeyword && tok.Value == "CASE" {
+			caseDepth++
+			p.advance()
+			continue
+		}
+		if tok.Type == TokenKeyword && tok.Value == "END" {
+			if caseDepth > 0 {
+				caseDepth--
+				p.advance()
+				continue
+			}
+			break // block END belonging to an enclosing BEGIN
+		}
+		if tok.Type == TokenKeyword && caseDepth == 0 {
+			if tok.Value == "WITH" {
+				// Table hint WITH (NOLOCK) vs. the next statement's CTE clause.
+				if p.peek(1).Type == TokenPunctuation && p.peek(1).Value == "(" {
+					p.advance()
+					p.skipParens()
+					continue
+				}
+				break
+			}
+			if stmtStartKeywords[tok.Value] {
+				break
+			}
+		}
 		if p.matchKeyword("JOIN") || p.matchKeyword("INNER") || p.matchKeyword("LEFT") || p.matchKeyword("RIGHT") || p.matchKeyword("CROSS") || p.matchKeyword("OUTER") || p.matchKeyword("FULL") {
 			// Advance past join type keywords until we get past JOIN
 			for p.matchKeyword("INNER") || p.matchKeyword("LEFT") || p.matchKeyword("RIGHT") || p.matchKeyword("CROSS") || p.matchKeyword("OUTER") || p.matchKeyword("FULL") || p.matchKeyword("JOIN") {
@@ -539,7 +618,7 @@ func (p *Parser) parseSelect(context string) {
 				p.advance()
 			}
 			name, alias := p.readTableWithAlias()
-			if name != "" {
+			if name != "" && !p.isCTE(name) {
 				fromTables[strings.ToLower(alias)] = name
 				if context != "" {
 					p.refs = append(p.refs, parser.RawReference{
@@ -589,6 +668,7 @@ func (p *Parser) parseSelectColumns() []selectItem {
 	var items []selectItem
 	var currentTokens []string
 	parenDepth := 0
+	caseDepth := 0
 
 	for p.pos < len(p.tokens) {
 		tok := p.current()
@@ -604,6 +684,28 @@ func (p *Parser) parseSelectColumns() []selectItem {
 		// Stop at semicolon
 		if p.matchPunct(";") {
 			break
+		}
+
+		// Stop at the closing paren of an enclosing construct (subquery/CTE body)
+		if parenDepth == 0 && p.matchPunct(")") {
+			break
+		}
+
+		// CASE...END is part of a column expression; a bare END or another
+		// statement-starting keyword means this SELECT had no FROM clause
+		// and the statement has ended (semicolons are optional in T-SQL).
+		if parenDepth == 0 && tok.Type == TokenKeyword {
+			if tok.Value == "CASE" {
+				caseDepth++
+			} else if tok.Value == "END" {
+				if caseDepth > 0 {
+					caseDepth--
+				} else {
+					break
+				}
+			} else if caseDepth == 0 && (tok.Value == "UNION" || stmtStartKeywords[tok.Value]) {
+				break
+			}
 		}
 
 		// Skip TOP N
@@ -866,25 +968,62 @@ func (p *Parser) parseUpdate(context string) {
 	updateLine := p.current().Line
 	p.advance() // skip UPDATE
 	targetTable := p.readQualifiedName()
-	if targetTable != "" && context != "" {
-		p.refs = append(p.refs, parser.RawReference{
-			FromSymbol:    context,
-			ToName:        unqualify(targetTable),
-			ToQualified:   targetTable,
-			ReferenceType: "writes_to",
-			Line:          p.current().Line,
-		})
+	if targetTable == "" {
+		return
 	}
 
-	// Parse SET clause for column references
-	if p.matchKeyword("SET") && context != "" && targetTable != "" {
+	// Parse SET clause; entries are emitted after FROM-clause alias resolution
+	// since "UPDATE u SET ... FROM dbo.Users u" names the target by alias.
+	var entries []setEntry
+	if p.matchKeyword("SET") {
 		p.advance()
-		p.parseSetClause(context, targetTable, updateLine)
+		entries = p.parseSetClause()
+	}
+
+	// UPDATE <alias> ... FROM <tables>: resolve the alias to the real table.
+	if p.matchKeyword("FROM") {
+		p.advance()
+		fromTables := p.collectFromTables(context, "reads_from")
+		if resolved, ok := fromTables[strings.ToLower(targetTable)]; ok {
+			targetTable = resolved
+		}
+	}
+
+	if context == "" {
+		return
+	}
+	p.refs = append(p.refs, parser.RawReference{
+		FromSymbol:    context,
+		ToName:        unqualify(targetTable),
+		ToQualified:   targetTable,
+		ReferenceType: "writes_to",
+		Line:          updateLine,
+	})
+	if !p.skipColumnLineage {
+		for _, e := range entries {
+			p.colRefs = append(p.colRefs, parser.ColumnReference{
+				SourceColumn:   e.sourceCol,
+				TargetColumn:   targetTable + "." + e.column,
+				DerivationType: e.derivation,
+				Expression:     e.expression,
+				Context:        context,
+				Line:           updateLine,
+			})
+		}
 	}
 }
 
+// setEntry is one "col = expr" assignment parsed from an UPDATE SET clause.
+type setEntry struct {
+	column     string
+	sourceCol  string
+	derivation string
+	expression string
+}
+
 // parseSetClause parses UPDATE ... SET col1 = expr1, col2 = expr2 ...
-func (p *Parser) parseSetClause(context, targetTable string, line int) {
+func (p *Parser) parseSetClause() []setEntry {
+	var entries []setEntry
 	for p.pos < len(p.tokens) {
 		// Stop at WHERE, FROM, OUTPUT, or semicolon
 		tok := p.current()
@@ -893,6 +1032,13 @@ func (p *Parser) parseSetClause(context, targetTable string, line int) {
 		}
 		if p.matchKeyword("WHERE") || p.matchKeyword("FROM") || p.matchKeyword("OUTPUT") || p.matchPunct(";") {
 			break
+		}
+		// Statement boundary: bare END or a keyword starting the next statement
+		if tok.Type == TokenKeyword && (tok.Value == "END" || stmtStartKeywords[tok.Value]) {
+			break
+		}
+		if p.matchPunct(")") {
+			break // closing paren of an enclosing construct
 		}
 
 		// Read column name
@@ -912,6 +1058,7 @@ func (p *Parser) parseSetClause(context, targetTable string, line int) {
 		// Read expression tokens until comma or stop keyword
 		var exprTokens []string
 		parenDepth := 0
+		caseDepth := 0
 		for p.pos < len(p.tokens) {
 			t := p.current()
 			if t.Type == TokenEOF {
@@ -925,6 +1072,17 @@ func (p *Parser) parseSetClause(context, targetTable string, line int) {
 				if p.matchKeyword("WHERE") || p.matchKeyword("FROM") || p.matchKeyword("OUTPUT") || p.matchPunct(";") {
 					break
 				}
+				// CASE...END is part of the expression; a bare END or another
+				// statement-starting keyword ends the (un-terminated) UPDATE.
+				if t.Type == TokenKeyword {
+					if t.Value == "CASE" {
+						caseDepth++
+					} else if t.Value == "END" && caseDepth > 0 {
+						caseDepth--
+					} else if caseDepth == 0 && (t.Value == "END" || stmtStartKeywords[t.Value]) {
+						break
+					}
+				}
 			}
 			if p.matchPunct("(") {
 				parenDepth++
@@ -932,13 +1090,15 @@ func (p *Parser) parseSetClause(context, targetTable string, line int) {
 			if p.matchPunct(")") {
 				if parenDepth > 0 {
 					parenDepth--
+				} else {
+					break // closing paren of an enclosing construct
 				}
 			}
 			exprTokens = append(exprTokens, t.Value)
 			p.advance()
 		}
 
-		if len(exprTokens) > 0 && !p.skipColumnLineage {
+		if len(exprTokens) > 0 {
 			merged := mergeQualifiedTokens(exprTokens)
 			exprStr := strings.Join(merged, " ")
 			derivation := "direct_copy"
@@ -949,33 +1109,56 @@ func (p *Parser) parseSetClause(context, targetTable string, line int) {
 			if srcCol == "" {
 				srcCol = exprStr
 			}
-			p.colRefs = append(p.colRefs, parser.ColumnReference{
-				SourceColumn:   srcCol,
-				TargetColumn:   targetTable + "." + colName,
-				DerivationType: derivation,
-				Expression:     exprStr,
-				Context:        context,
-				Line:           line,
+			entries = append(entries, setEntry{
+				column:     colName,
+				sourceCol:  srcCol,
+				derivation: derivation,
+				expression: exprStr,
 			})
 		}
 	}
+	return entries
 }
 
 func (p *Parser) parseDelete(context string) {
+	deleteLine := p.current().Line
 	p.advance() // skip DELETE
 
+	// Skip TOP (n)
+	if p.matchKeyword("TOP") {
+		p.advance()
+		if p.matchPunct("(") {
+			p.skipParens()
+		}
+	}
+
+	hadFrom := false
 	if p.matchKeyword("FROM") {
 		p.advance()
+		hadFrom = true
 	}
 
 	name := p.readQualifiedName()
-	if name != "" && context != "" {
+	if name == "" {
+		return
+	}
+
+	// DELETE <alias> FROM <tables>: resolve the alias to the real table.
+	if !hadFrom && p.matchKeyword("FROM") {
+		p.advance()
+		fromTables := p.collectFromTables(context, "reads_from")
+		if resolved, ok := fromTables[strings.ToLower(name)]; ok {
+			name = resolved
+		}
+	}
+
+	if context != "" {
 		p.refs = append(p.refs, parser.RawReference{
 			FromSymbol:    context,
 			ToName:        unqualify(name),
 			ToQualified:   name,
 			ReferenceType: "writes_to",
-			Line:          p.current().Line,
+			Line:          deleteLine,
 		})
 	}
 }
@@ -1025,6 +1208,85 @@ func (p *Parser) current() Token {
 func (p *Parser) advance() {
 	if p.pos < len(p.tokens) {
 		p.pos++
+	}
+}
+
+// peek returns the token n positions ahead of the current one.
+func (p *Parser) peek(n int) Token {
+	if p.pos+n >= len(p.tokens) {
+		return Token{Type: TokenEOF}
+	}
+	return p.tokens[p.pos+n]
+}
+
+// isCTE reports whether name refers to a CTE declared earlier in this batch.
+// CTE names are always unqualified, so schema-qualified names never match.
+func (p *Parser) isCTE(name string) bool {
+	if strings.Contains(name, ".") {
+		return false
+	}
+	return p.cteNames[strings.ToLower(name)]
+}
+
+// parseWith parses a statement-level CTE clause:
+//
+//	WITH name [(cols)] AS ( SELECT ... ) [, name2 AS ( ... )]
+//
+// CTE names are recorded so later FROM/JOIN clauses don't emit them as table
+// references. Table reads inside CTE bodies are attributed to context, but
+// column lineage is suppressed (the CTE output is not the context's output).
+// The main statement following the CTE list is left for the caller to dispatch.
+func (p *Parser) parseWith(context string) {
+	p.advance() // skip WITH
+	for {
+		tok := p.current()
+		if tok.Type != TokenIdent {
+			return
+		}
+		p.cteNames[strings.ToLower(tok.Value)] = true
+		p.advance()
+
+		// Optional column list
+		if p.matchPunct("(") {
+			p.skipParens()
+		}
+		if p.matchKeyword("AS") {
+			p.advance()
+		}
+		// CTE body
+		if p.matchPunct("(") {
+			p.advance()
+			if p.matchKeyword("SELECT") {
+				saved := p.skipColumnLineage
+				p.skipColumnLineage = true
+				p.parseSelect(context)
+				p.skipColumnLineage = saved
+			}
+			p.skipToMatchingClose()
+		}
+
+		if p.matchPunct(",") {
+			p.advance()
+			continue
+		}
+		return
+	}
+}
+
+// skipToMatchingClose consumes tokens until the close paren matching an
+// already-consumed open paren (starting depth 1).
+func (p *Parser) skipToMatchingClose() {
+	depth := 1
+	for p.pos < len(p.tokens) && depth > 0 {
+		if p.current().Type == TokenEOF {
+			return
+		}
+		if p.matchPunct("(") {
+			depth++
+		} else if p.matchPunct(")") {
+			depth--
+		}
+		p.advance()
 	}
 }
 
@@ -1159,44 +1421,34 @@ func (p *Parser) readTableWithAlias() (string, string) {
 
 // collectFromTables reads the FROM clause (including comma-separated tables) and
 // returns an alias→qualifiedName map. Also appends reads_from references if context is set.
+// CTE names declared earlier in the batch are skipped (they are not real tables).
 func (p *Parser) collectFromTables(context, refType string) map[string]string {
 	fromTables := make(map[string]string)
 
-	name, alias := p.readTableWithAlias()
-	if name == "" {
-		return fromTables
-	}
-	fromTables[strings.ToLower(alias)] = name
-	if context != "" {
-		p.refs = append(p.refs, parser.RawReference{
-			FromSymbol:    context,
-			ToName:        unqualify(name),
-			ToQualified:   name,
-			ReferenceType: refType,
-			Line:          p.currentLine(),
-		})
-	}
-
-	// Handle comma-separated tables: FROM dbo.Users u, dbo.Roles r
-	for p.matchPunct(",") {
-		p.advance()
-		name, alias = p.readTableWithAlias()
+	for {
+		name, alias := p.readTableWithAlias()
 		if name == "" {
-			break
+			return fromTables
 		}
-		fromTables[strings.ToLower(alias)] = name
-		if context != "" {
-			p.refs = append(p.refs, parser.RawReference{
-				FromSymbol:    context,
-				ToName:        unqualify(name),
-				ToQualified:   name,
-				ReferenceType: refType,
-				Line:          p.currentLine(),
-			})
+		if !p.isCTE(name) {
+			fromTables[strings.ToLower(alias)] = name
+			if context != "" {
+				p.refs = append(p.refs, parser.RawReference{
+					FromSymbol:    context,
+					ToName:        unqualify(name),
+					ToQualified:   name,
+					ReferenceType: refType,
+					Line:          p.currentLine(),
+				})
+			}
 		}
-	}
 
-	return fromTables
+		// Handle comma-separated tables: FROM dbo.Users u, dbo.Roles r
+		if !p.matchPunct(",") {
+			return fromTables
+		}
+		p.advance()
+	}
 }
 
 // qualifyColumn resolves a column reference using FROM-clause table aliases.

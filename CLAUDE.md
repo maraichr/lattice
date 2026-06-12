@@ -66,7 +66,7 @@ Each stage reads/writes to `IndexRunContext` which carries state through the pip
 ### Parser System
 
 `internal/parser/parser.go` defines the `Parser` interface. Each language has its own subpackage:
-- `tsql/`, `pgsql/` — Hand-written SQL parsers (T-SQL uses regex-based, PgSQL uses `pg_query_go`)
+- `tsql/`, `pgsql/` — Hand-written SQL parsers (T-SQL uses a hand-rolled lexer + recursive descent, PgSQL uses `pg_query_go`)
 - `java/` — Uses `go-tree-sitter`
 - `asp/`, `delphi/`, `csharp/` — Hand-written parsers
 
