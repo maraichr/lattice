@@ -195,7 +195,9 @@ func parsePascal(input parser.FileInput) (*parser.ParseResult, error) {
 }
 
 // extractPascalSQLRefs detects SQL patterns in Delphi/Pascal source code:
-// SQL.Text assignment, SQL.Add accumulation, CommandText assignment, ExecSQL/Open.
+// SQL.Text assignment, SQL.Add accumulation, CommandText assignment, and
+// stored procedure bindings (StoredProcName/ProcedureName). Component
+// prefixes are optional so code inside with-blocks is also covered.
 func extractPascalSQLRefs(lines []string, symbols []parser.Symbol) []parser.RawReference {
 	var refs []parser.RawReference
 
@@ -217,49 +219,45 @@ func extractPascalSQLRefs(lines []string, symbols []parser.Symbol) []parser.RawR
 	}
 
 	// Regex patterns for SQL assignments
-	sqlTextAssign := regexp.MustCompile(`(?i)(\w+)\.SQL\.Text\s*:=\s*(.+)`)
-	sqlAdd := regexp.MustCompile(`(?i)(\w+)\.SQL\.Add\s*\(\s*'(.+?)'\s*\)`)
-	commandTextAssign := regexp.MustCompile(`(?i)(\w+)\.CommandText\s*:=\s*'(.+?)'`)
+	sqlTextAssign := regexp.MustCompile(`(?i)(?:(\w+)\.)?SQL\.Text\s*:=\s*(.+)`)
+	sqlAdd := regexp.MustCompile(`(?i)(?:(\w+)\.)?SQL\.Add\s*\(\s*(.+)\)`)
+	commandTextAssign := regexp.MustCompile(`(?i)(?:(\w+)\.)?CommandText\s*:=\s*(.+)`)
+	storedProcAssign := regexp.MustCompile(`(?i)(?:(\w+)\.)?(?:StoredProcName|ProcedureName)\s*:=\s*'([^']+)'`)
 
 	// Multi-line SQL.Text concatenation tracking
 	var sqlTextBuilder strings.Builder
-	sqlTextComponent := ""
 	sqlTextStartLine := 0
 	inSQLConcat := false
+
+	// Consecutive SQL.Add calls build one statement, so clauses split across
+	// calls (SELECT on one line, FROM on the next) keep their table refs.
+	var addBuilder strings.Builder
+	addComponent := ""
+	addStartLine := 0
+	addActive := false
+
+	flushAdd := func() {
+		if !addActive {
+			return
+		}
+		addActive = false
+		fullSQL := addBuilder.String()
+		addBuilder.Reset()
+		if sqlutil.LooksLikeSQL(fullSQL) {
+			from := findEnclosing(addStartLine)
+			tableRefs := sqlutil.ExtractTableRefs(fullSQL, addStartLine, from, "dbo")
+			for j := range tableRefs {
+				tableRefs[j].Confidence = 0.85
+			}
+			refs = append(refs, tableRefs...)
+		}
+	}
 
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		lineNum := i + 1
 
-		// SQL.Text := 'SELECT * FROM ...'
-		// May be multi-line: SQL.Text := 'SELECT * ' + #13#10 + 'FROM table'
-		if m := sqlTextAssign.FindStringSubmatch(trimmed); len(m) >= 3 {
-			component := m[1]
-			rest := m[2]
-
-			// Extract string parts from the assignment
-			sqlStr := extractPascalStrings(rest)
-			if isContinued(rest) {
-				// Multi-line concatenation
-				sqlTextBuilder.Reset()
-				sqlTextBuilder.WriteString(sqlStr)
-				sqlTextComponent = component
-				sqlTextStartLine = lineNum
-				inSQLConcat = true
-			} else {
-				if sqlutil.LooksLikeSQL(sqlStr) {
-					from := findEnclosing(lineNum)
-					tableRefs := sqlutil.ExtractTableRefs(sqlStr, lineNum, from, "dbo")
-					for j := range tableRefs {
-						tableRefs[j].Confidence = 0.9
-					}
-					refs = append(refs, tableRefs...)
-				}
-			}
-			continue
-		}
-
-		// Continue multi-line concatenation
+		// Continue multi-line SQL.Text concatenation
 		if inSQLConcat {
 			sqlStr := extractPascalStrings(trimmed)
 			sqlTextBuilder.WriteString(" " + sqlStr)
@@ -274,28 +272,62 @@ func extractPascalSQLRefs(lines []string, symbols []parser.Symbol) []parser.RawR
 					}
 					refs = append(refs, tableRefs...)
 				}
-				_ = sqlTextComponent
 			}
 			continue
 		}
 
-		// SQL.Add('...')
-		if m := sqlAdd.FindStringSubmatch(trimmed); len(m) >= 3 {
-			sqlStr := m[2]
-			if sqlutil.LooksLikeSQL(sqlStr) {
+		// SQL.Add('...') — accumulate consecutive calls to the same component
+		if m := sqlAdd.FindStringSubmatch(trimmed); m != nil {
+			component := strings.ToLower(m[1])
+			if addActive && component != addComponent {
+				flushAdd()
+			}
+			if !addActive {
+				addActive = true
+				addComponent = component
+				addStartLine = lineNum
+			}
+			addBuilder.WriteString(extractPascalStrings(m[2]))
+			addBuilder.WriteString(" ")
+			continue
+		}
+		// Any other statement ends a SQL.Add accumulation.
+		flushAdd()
+
+		// StoredProc1.StoredProcName := 'GetUsers'
+		// ADOStoredProc1.ProcedureName := 'GetUsers;1'
+		if m := storedProcAssign.FindStringSubmatch(trimmed); m != nil {
+			if ref, ok := procCallRef(m[2], findEnclosing(lineNum), lineNum); ok {
+				refs = append(refs, ref)
+			}
+			continue
+		}
+
+		// SQL.Text := 'SELECT * FROM ...'
+		// May be multi-line: SQL.Text := 'SELECT * ' + #13#10 + 'FROM table'
+		if m := sqlTextAssign.FindStringSubmatch(trimmed); m != nil {
+			rest := m[2]
+			sqlStr := extractPascalStrings(rest)
+			if isContinued(rest) {
+				// Multi-line concatenation
+				sqlTextBuilder.Reset()
+				sqlTextBuilder.WriteString(sqlStr)
+				sqlTextStartLine = lineNum
+				inSQLConcat = true
+			} else if sqlutil.LooksLikeSQL(sqlStr) {
 				from := findEnclosing(lineNum)
 				tableRefs := sqlutil.ExtractTableRefs(sqlStr, lineNum, from, "dbo")
 				for j := range tableRefs {
-					tableRefs[j].Confidence = 0.85
+					tableRefs[j].Confidence = 0.9
 				}
 				refs = append(refs, tableRefs...)
 			}
 			continue
 		}
 
-		// CommandText := 'EXEC dbo.GetUser' or CommandText := 'SELECT ...'
-		if m := commandTextAssign.FindStringSubmatch(trimmed); len(m) >= 3 {
-			sqlStr := m[2]
+		// CommandText := 'EXEC dbo.GetUser', 'SELECT ...', or a bare proc name
+		if m := commandTextAssign.FindStringSubmatch(trimmed); m != nil {
+			sqlStr := extractPascalStrings(m[2])
 			from := findEnclosing(lineNum)
 			if sqlutil.LooksLikeSQL(sqlStr) {
 				tableRefs := sqlutil.ExtractTableRefs(sqlStr, lineNum, from, "dbo")
@@ -303,11 +335,40 @@ func extractPascalSQLRefs(lines []string, symbols []parser.Symbol) []parser.RawR
 					tableRefs[j].Confidence = 0.9
 				}
 				refs = append(refs, tableRefs...)
+			} else if ref, ok := procCallRef(sqlStr, from, lineNum); ok {
+				refs = append(refs, ref)
 			}
 		}
 	}
+	flushAdd()
 
 	return refs
+}
+
+var procNameRe = regexp.MustCompile(`^[A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)*$`)
+
+// procCallRef builds a "calls" reference to a stored procedure. ADO appends
+// an overload ordinal to procedure names ('GetUsers;1') which is stripped.
+func procCallRef(name, from string, line int) (parser.RawReference, bool) {
+	name = strings.TrimSpace(name)
+	if idx := strings.IndexByte(name, ';'); idx >= 0 {
+		name = name[:idx]
+	}
+	if !procNameRe.MatchString(name) {
+		return parser.RawReference{}, false
+	}
+	ref := parser.RawReference{
+		FromSymbol:    from,
+		ToName:        name,
+		ReferenceType: "calls",
+		Line:          line,
+	}
+	if strings.Contains(name, ".") {
+		ref.ToQualified = name
+	} else {
+		ref.ToQualified = "dbo." + name
+	}
+	return ref, true
 }
 
 // extractPascalStrings extracts string content from Pascal string expressions.

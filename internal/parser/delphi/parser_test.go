@@ -171,14 +171,8 @@ func TestDFMCommandText(t *testing.T) {
 end`
 
 	_, refs := ParseDFM(content, 0)
-	// The EXEC should create a calls ref via extractDFMSQLRefs
-	// But extractDFMSQLRefs currently only uses FROM/JOIN/INTO/UPDATE patterns.
-	// The SQL is passed to extractDFMSQLRefs which won't match EXEC.
-	// The CommandText detection stores the SQL string, then extractDFMSQLRefs processes it.
-	// We need to check if any refs were created
-	if len(refs) > 0 {
-		// Good - some refs found
-	}
+	callRefs := filterRefs(refs, "calls")
+	assertRefTarget(t, callRefs, "dbo.GetUserById")
 }
 
 func TestDFMSelectSQLStrings(t *testing.T) {
@@ -194,6 +188,215 @@ end`
 	_, refs := ParseDFM(content, 0)
 	tableRefs := filterRefs(refs, "uses_table")
 	assertRefTarget(t, tableRefs, "Orders")
+}
+
+func TestPascalSQLAddSplitClauses(t *testing.T) {
+	src := `unit DataModule;
+
+implementation
+
+procedure TDataModule.LoadInvoices;
+begin
+  MyQuery.SQL.Clear;
+  MyQuery.SQL.Add('SELECT i.ID, i.Total');
+  MyQuery.SQL.Add('FROM');
+  MyQuery.SQL.Add('Invoices i');
+  MyQuery.SQL.Add('JOIN Customers c ON c.ID = i.CustomerID');
+  MyQuery.Open;
+end;
+
+end.`
+
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "DataModule.pas", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tableRefs := filterRefs(result.References, "uses_table")
+	assertRefTarget(t, tableRefs, "Invoices")
+	assertRefTarget(t, tableRefs, "Customers")
+}
+
+func TestPascalStoredProcName(t *testing.T) {
+	src := `unit DataModule;
+
+implementation
+
+procedure TDataModule.GetBalance;
+begin
+  spBalance.StoredProcName := 'GetCustomerBalance';
+  spBalance.ExecProc;
+end;
+
+end.`
+
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "DataModule.pas", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(result.References, "calls")
+	assertRefTarget(t, callRefs, "GetCustomerBalance")
+	if len(callRefs) != 1 || callRefs[0].ToQualified != "dbo.GetCustomerBalance" {
+		t.Errorf("expected ToQualified dbo.GetCustomerBalance, got %+v", callRefs)
+	}
+	if callRefs[0].FromSymbol != "DataModule.TDataModule.GetBalance" {
+		t.Errorf("expected FromSymbol DataModule.TDataModule.GetBalance, got %s", callRefs[0].FromSymbol)
+	}
+}
+
+func TestPascalProcedureNameInWithBlock(t *testing.T) {
+	src := `unit DataModule;
+
+implementation
+
+procedure TDataModule.RunOrders;
+begin
+  with ADOStoredProc1 do
+  begin
+    ProcedureName := 'usp_GetOrders;1';
+    Open;
+  end;
+end;
+
+end.`
+
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "DataModule.pas", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(result.References, "calls")
+	assertRefTarget(t, callRefs, "usp_GetOrders")
+}
+
+func TestPascalCommandTextProcName(t *testing.T) {
+	src := `unit DataModule;
+
+implementation
+
+procedure TDataModule.Cleanup;
+begin
+  MyCmd.CommandText := 'PurgeExpiredSessions';
+  MyCmd.Execute;
+end;
+
+end.`
+
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "DataModule.pas", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(result.References, "calls")
+	assertRefTarget(t, callRefs, "PurgeExpiredSessions")
+}
+
+func TestDFMSQLStringsParenOnLastLine(t *testing.T) {
+	// The Delphi DFM writer puts the closing paren on the last string's line.
+	content := `object Form1: TForm1
+  object qryUsers: TADOQuery
+    SQL.Strings = (
+      'SELECT * '
+      'FROM dbo.Users')
+    Left = 24
+  end
+end`
+
+	_, refs := ParseDFM(content, 0)
+	tableRefs := filterRefs(refs, "uses_table")
+	assertRefTarget(t, tableRefs, "dbo.Users")
+	if len(tableRefs) != 1 || tableRefs[0].ToQualified != "dbo.Users" {
+		t.Errorf("expected ToQualified dbo.Users, got %+v", tableRefs)
+	}
+}
+
+func TestDFMSQLStringsContinuation(t *testing.T) {
+	// Long list items are split mid-token across lines with a trailing '+'.
+	content := `object Form1: TForm1
+  object qryOrders: TADOQuery
+    SQL.Strings = (
+      'SELECT * FROM Ord' +
+      'ers o'
+      'WHERE o.Status = 1')
+  end
+end`
+
+	_, refs := ParseDFM(content, 0)
+	tableRefs := filterRefs(refs, "uses_table")
+	assertRefTarget(t, tableRefs, "Orders")
+}
+
+func TestDFMStoredProcName(t *testing.T) {
+	content := `object DataModule1: TDataModule
+  object spBalance: TStoredProc
+    DatabaseName = 'Main'
+    StoredProcName = 'GetCustomerBalance'
+  end
+  object spOrders: TADOStoredProc
+    ProcedureName = 'usp_GetOrders;1'
+  end
+end`
+
+	symbols, refs := ParseDFM(content, 0)
+	assertHasSymbol(t, symbols, "TStoredProc.spBalance", "variable")
+
+	callRefs := filterRefs(refs, "calls")
+	assertRefTarget(t, callRefs, "GetCustomerBalance")
+	assertRefTarget(t, callRefs, "usp_GetOrders")
+	for _, r := range callRefs {
+		if r.ToName == "usp_GetOrders" && r.FromSymbol != "spOrders" {
+			t.Errorf("expected FromSymbol spOrders, got %s", r.FromSymbol)
+		}
+	}
+}
+
+func TestDFMCommandTextProcName(t *testing.T) {
+	content := `object Form1: TForm1
+  object cmdPurge: TADOCommand
+    CommandText = 'PurgeExpiredSessions'
+  end
+end`
+
+	_, refs := ParseDFM(content, 0)
+	callRefs := filterRefs(refs, "calls")
+	assertRefTarget(t, callRefs, "PurgeExpiredSessions")
+}
+
+func TestDFMCommandTextTableType(t *testing.T) {
+	// With CommandType = cmdTable, CommandText holds a table name, not a proc.
+	content := `object Form1: TForm1
+  object tblUsers: TADODataSet
+    CommandText = 'Users'
+    CommandType = cmdTable
+  end
+end`
+
+	_, refs := ParseDFM(content, 0)
+	if calls := filterRefs(refs, "calls"); len(calls) != 0 {
+		t.Errorf("expected no calls refs for cmdTable, got %+v", calls)
+	}
+	tableRefs := filterRefs(refs, "uses_table")
+	assertRefTarget(t, tableRefs, "Users")
+}
+
+func TestDFMCommandTextMultiLine(t *testing.T) {
+	content := `object Form1: TForm1
+  object qryReport: TADOQuery
+    CommandText = 'SELECT r.ID, r.Name ' +
+      'FROM Reports r ' +
+      'JOIN Runs x ON x.ReportID = r.ID'
+  end
+end`
+
+	_, refs := ParseDFM(content, 0)
+	tableRefs := filterRefs(refs, "uses_table")
+	assertRefTarget(t, tableRefs, "Reports")
+	assertRefTarget(t, tableRefs, "Runs")
 }
 
 // --- helpers ---
