@@ -572,6 +572,244 @@ GO
 	}
 }
 
+func TestStatementAfterUnterminatedSelect(t *testing.T) {
+	// T-SQL does not require semicolon terminators; statements following a
+	// SELECT without one must still be parsed.
+	input := `
+CREATE PROCEDURE dbo.DoStuff
+AS
+BEGIN
+    SELECT Name FROM dbo.Users
+    INSERT INTO dbo.AuditLog (Name) VALUES ('x')
+    EXEC dbo.Notify
+END
+GO
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "test.sql", Content: []byte(input)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	refTypes := map[string]bool{}
+	for _, ref := range result.References {
+		refTypes[ref.ReferenceType+":"+ref.ToQualified] = true
+		if ref.FromSymbol != "dbo.DoStuff" {
+			t.Errorf("expected refs from dbo.DoStuff, got from %s", ref.FromSymbol)
+		}
+	}
+	if !refTypes["reads_from:dbo.Users"] {
+		t.Error("expected reads_from reference to dbo.Users")
+	}
+	if !refTypes["writes_to:dbo.AuditLog"] {
+		t.Error("expected writes_to reference to dbo.AuditLog after un-terminated SELECT")
+	}
+	if !refTypes["calls:dbo.Notify"] {
+		t.Error("expected calls reference to dbo.Notify")
+	}
+}
+
+func TestDeleteWithAlias(t *testing.T) {
+	input := `
+CREATE PROCEDURE dbo.Cleanup
+AS
+BEGIN
+    DELETE u FROM dbo.Users u WHERE u.IsDeleted = 1;
+END
+GO
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "test.sql", Content: []byte(input)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foundWrite := false
+	for _, ref := range result.References {
+		if ref.ToQualified == "u" {
+			t.Errorf("reference to alias %q instead of the real table", ref.ToQualified)
+		}
+		if ref.ReferenceType == "writes_to" && ref.ToQualified == "dbo.Users" {
+			foundWrite = true
+		}
+	}
+	if !foundWrite {
+		t.Error("expected writes_to reference to dbo.Users from DELETE alias form")
+	}
+}
+
+func TestUpdateWithAliasFrom(t *testing.T) {
+	input := `
+CREATE PROCEDURE dbo.SyncNames
+AS
+BEGIN
+    UPDATE u SET Name = s.Name FROM dbo.Users u, dbo.Staging s WHERE u.ID = s.ID;
+END
+GO
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "test.sql", Content: []byte(input)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	refTypes := map[string]bool{}
+	for _, ref := range result.References {
+		if ref.ToQualified == "u" {
+			t.Errorf("reference to alias %q instead of the real table", ref.ToQualified)
+		}
+		refTypes[ref.ReferenceType+":"+ref.ToQualified] = true
+	}
+	if !refTypes["writes_to:dbo.Users"] {
+		t.Error("expected writes_to reference to dbo.Users from UPDATE alias form")
+	}
+	if !refTypes["reads_from:dbo.Staging"] {
+		t.Error("expected reads_from reference to dbo.Staging from UPDATE ... FROM")
+	}
+
+	// SET-clause lineage should target the resolved table, not the alias
+	foundLineage := false
+	for _, cr := range result.ColumnReferences {
+		if cr.TargetColumn == "dbo.Users.Name" {
+			foundLineage = true
+		}
+		if strings.HasPrefix(cr.TargetColumn, "u.") {
+			t.Errorf("column lineage targets alias: %s", cr.TargetColumn)
+		}
+	}
+	if !foundLineage {
+		t.Error("expected column lineage targeting dbo.Users.Name")
+	}
+}
+
+func TestCaseEndInProcBody(t *testing.T) {
+	// CASE...END outside a SELECT must not be mistaken for a block-closing END.
+	input := `
+CREATE PROCEDURE dbo.Classify
+AS
+BEGIN
+    DECLARE @x INT
+    SET @x = CASE WHEN 1 = 1 THEN 2 ELSE 3 END
+    INSERT INTO dbo.Results (Val) VALUES (1)
+END
+GO
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "test.sql", Content: []byte(input)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, ref := range result.References {
+		if ref.ReferenceType == "writes_to" && ref.ToQualified == "dbo.Results" {
+			found = true
+			if ref.FromSymbol != "dbo.Classify" {
+				t.Errorf("INSERT attributed to %s, expected dbo.Classify", ref.FromSymbol)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected writes_to reference to dbo.Results inside proc body")
+	}
+}
+
+func TestCTENotEmittedAsTable(t *testing.T) {
+	input := `
+CREATE VIEW dbo.ActiveUsers
+AS
+WITH recent AS (SELECT UserID FROM dbo.Logins)
+SELECT u.Name FROM dbo.Users u JOIN recent r ON r.UserID = u.UserID
+GO
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "test.sql", Content: []byte(input)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	refTypes := map[string]bool{}
+	for _, ref := range result.References {
+		if ref.ToQualified == "recent" {
+			t.Error("CTE name 'recent' emitted as a table reference")
+		}
+		refTypes[ref.ReferenceType+":"+ref.ToQualified] = true
+	}
+	if !refTypes["reads_from:dbo.Users"] {
+		t.Error("expected reads_from reference to dbo.Users")
+	}
+	if !refTypes["reads_from:dbo.Logins"] {
+		t.Error("expected reads_from reference to dbo.Logins from CTE body")
+	}
+}
+
+func TestProcedureWithCTE(t *testing.T) {
+	input := `
+CREATE PROCEDURE dbo.GetRecent
+AS
+BEGIN
+    WITH recent AS (SELECT UserID FROM dbo.Logins)
+    SELECT r.UserID FROM recent r;
+    INSERT INTO dbo.Audit (Action) VALUES ('read');
+END
+GO
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "test.sql", Content: []byte(input)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	refTypes := map[string]bool{}
+	for _, ref := range result.References {
+		if ref.ToQualified == "recent" {
+			t.Error("CTE name 'recent' emitted as a table reference")
+		}
+		refTypes[ref.ReferenceType+":"+ref.ToQualified] = true
+	}
+	if !refTypes["reads_from:dbo.Logins"] {
+		t.Error("expected reads_from reference to dbo.Logins from CTE body")
+	}
+	if !refTypes["writes_to:dbo.Audit"] {
+		t.Error("expected writes_to reference to dbo.Audit after CTE statement")
+	}
+}
+
+func TestTopLevelSelectEmitsScriptSymbol(t *testing.T) {
+	// Any top-level statement that generates references must also emit the
+	// synthetic script symbol, or its edges dangle.
+	input := `
+SELECT Name FROM dbo.Users
+GO
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "scripts/report.sql", Content: []byte(input)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var scriptSym *parser.Symbol
+	for i, s := range result.Symbols {
+		if s.Kind == "script" {
+			scriptSym = &result.Symbols[i]
+			break
+		}
+	}
+	if scriptSym == nil {
+		t.Fatal("expected a script symbol for top-level SELECT")
+	}
+
+	found := false
+	for _, ref := range result.References {
+		if ref.FromSymbol == scriptSym.QualifiedName && ref.ReferenceType == "reads_from" && ref.ToQualified == "dbo.Users" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected reads_from reference from the script symbol to dbo.Users")
+	}
+}
+
 func TestTopLevelExecNoRefsWhenEmpty(t *testing.T) {
 	// When there are no top-level EXEC statements, no script symbol should be emitted
 	input := `

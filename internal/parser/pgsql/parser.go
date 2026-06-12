@@ -21,7 +21,8 @@ func (p *PgSQLParser) Languages() []string {
 }
 
 func (p *PgSQLParser) Parse(input parser.FileInput) (*parser.ParseResult, error) {
-	tree, err := pg_query.Parse(string(input.Content))
+	src := string(input.Content)
+	tree, err := pg_query.Parse(src)
 	if err != nil {
 		return nil, fmt.Errorf("pg_query parse: %w", err)
 	}
@@ -30,6 +31,7 @@ func (p *PgSQLParser) Parse(input parser.FileInput) (*parser.ParseResult, error)
 		symbols: make([]parser.Symbol, 0),
 		refs:    make([]parser.RawReference, 0),
 		colRefs: make([]parser.ColumnReference, 0),
+		src:     src,
 	}
 
 	for _, stmt := range tree.Stmts {
@@ -48,6 +50,33 @@ type walker struct {
 	refs    []parser.RawReference
 	colRefs []parser.ColumnReference
 	context string // current symbol context for references
+	src     string // original source, for offset→line conversion
+}
+
+// lineOf converts a byte offset (pg_query locations are offsets, not lines)
+// into a 1-based line number. Statement locations point just past the previous
+// statement's terminator, so leading whitespace is skipped first.
+func (w *walker) lineOf(offset int) int {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(w.src) {
+		offset = len(w.src)
+	}
+	for offset < len(w.src) {
+		c := w.src[offset]
+		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+			break
+		}
+		offset++
+	}
+	line := 1
+	for i := 0; i < offset; i++ {
+		if w.src[i] == '\n' {
+			line++
+		}
+	}
+	return line
 }
 
 func (w *walker) walkStatement(rawStmt *pg_query.RawStmt) {
@@ -56,7 +85,7 @@ func (w *walker) walkStatement(rawStmt *pg_query.RawStmt) {
 	}
 
 	node := rawStmt.Stmt
-	startLine := int(rawStmt.StmtLocation)
+	startLine := w.lineOf(int(rawStmt.StmtLocation))
 
 	switch {
 	case node.GetCreateStmt() != nil:
@@ -85,7 +114,7 @@ func (w *walker) walkCreateTable(stmt *pg_query.CreateStmt, startLine int) {
 		QualifiedName: name,
 		Kind:          "table",
 		Language:      "pgsql",
-		StartLine:     startLine + 1,
+		StartLine:     startLine,
 	}
 
 	// Extract columns
@@ -96,8 +125,8 @@ func (w *walker) walkCreateTable(stmt *pg_query.CreateStmt, startLine int) {
 				QualifiedName: name + "." + colDef.Colname,
 				Kind:          "column",
 				Language:      "pgsql",
-				StartLine:     int(colDef.Location) + 1,
-				EndLine:       int(colDef.Location) + 1,
+				StartLine:     w.lineOf(int(colDef.Location)),
+				EndLine:       w.lineOf(int(colDef.Location)),
 			}
 			sym.Children = append(sym.Children, col)
 		}
@@ -114,7 +143,7 @@ func (w *walker) walkCreateView(stmt *pg_query.ViewStmt, startLine int) {
 		QualifiedName: name,
 		Kind:          "view",
 		Language:      "pgsql",
-		StartLine:     startLine + 1,
+		StartLine:     startLine,
 	}
 
 	// Extract references and column lineage from the view query
@@ -153,7 +182,7 @@ func (w *walker) walkCreateFunction(stmt *pg_query.CreateFunctionStmt, startLine
 		QualifiedName: qualifiedName,
 		Kind:          kind,
 		Language:      "pgsql",
-		StartLine:     startLine + 1,
+		StartLine:     startLine,
 	}
 
 	// Build signature from parameters
@@ -205,8 +234,8 @@ func (w *walker) walkCreateTrigger(stmt *pg_query.CreateTrigStmt, startLine int)
 		QualifiedName: qualifiedName,
 		Kind:          "trigger",
 		Language:      "pgsql",
-		StartLine:     startLine + 1,
-		EndLine:       startLine + 1,
+		StartLine:     startLine,
+		EndLine:       startLine,
 	}
 
 	// Reference the table the trigger is ON

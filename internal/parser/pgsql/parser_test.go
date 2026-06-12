@@ -106,6 +106,40 @@ $$;
 	}
 }
 
+func TestSymbolLineNumbers(t *testing.T) {
+	// pg_query statement locations are byte offsets; symbols must report lines.
+	input := `CREATE TABLE users (id int);
+
+CREATE TABLE orders (
+    id int,
+    user_id int
+);`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "test.sql", Content: []byte(input)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lines := map[string]int{}
+	colLines := map[string]int{}
+	for _, s := range result.Symbols {
+		lines[s.Name] = s.StartLine
+		for _, c := range s.Children {
+			colLines[s.Name+"."+c.Name] = c.StartLine
+		}
+	}
+
+	if lines["users"] != 1 {
+		t.Errorf("expected users at line 1, got %d", lines["users"])
+	}
+	if lines["orders"] != 3 {
+		t.Errorf("expected orders at line 3, got %d", lines["orders"])
+	}
+	if colLines["orders.user_id"] != 5 {
+		t.Errorf("expected orders.user_id at line 5, got %d", colLines["orders.user_id"])
+	}
+}
+
 func TestParseCreateTrigger(t *testing.T) {
 	input := `
 CREATE TRIGGER trg_user_update
