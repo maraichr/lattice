@@ -93,6 +93,9 @@ func (p *Parser) Parse(input parser.FileInput) (*parser.ParseResult, error) {
 	procRefs := extractStoredProcRefs(root, input.Content, classRanges)
 	refs = append(refs, procRefs...)
 
+	varRefs := extractSQLVariableRefs(root, input.Content, classRanges)
+	refs = append(refs, varRefs...)
+
 	// Extract ASP.NET Core routing attributes ([Route], [HttpGet], [HttpPost], …)
 	// and emit endpoint symbols for cross-language API matching.
 	endpointSyms := extractASPNetEndpoints(root, input.Content, namespace)
@@ -801,7 +804,20 @@ func extractFirstStringArg(argList *sitter.Node, src []byte) string {
 	return ""
 }
 
-// extractStoredProcRefs detects SqlCommand constructor and CommandText assignment patterns.
+// adoCommandTypes are ADO.NET command/adapter types whose first string
+// constructor argument is a SQL statement or stored procedure name. Includes
+// the legacy OleDb/Odbc providers common in .NET Framework-era enterprise apps.
+var adoCommandTypes = map[string]bool{
+	"SqlCommand":       true,
+	"OleDbCommand":     true,
+	"OdbcCommand":      true,
+	"SqlCeCommand":     true,
+	"SqlDataAdapter":   true,
+	"OleDbDataAdapter": true,
+	"OdbcDataAdapter":  true,
+}
+
+// extractStoredProcRefs detects ADO.NET command constructor and CommandText assignment patterns.
 func extractStoredProcRefs(root *sitter.Node, src []byte, classRanges []classRange) []parser.RawReference {
 	var refs []parser.RawReference
 
@@ -811,7 +827,7 @@ func extractStoredProcRefs(root *sitter.Node, src []byte, classRanges []classRan
 
 		switch node.Type() {
 		case "object_creation_expression":
-			// new SqlCommand("ProcName", ...)
+			// new SqlCommand("ProcName", ...), new SqlDataAdapter("SELECT ...", ...)
 			typeName := ""
 			for i := 0; i < int(node.ChildCount()); i++ {
 				child := node.Child(i)
@@ -820,7 +836,11 @@ func extractStoredProcRefs(root *sitter.Node, src []byte, classRanges []classRan
 					break
 				}
 			}
-			if typeName != "SqlCommand" {
+			// Allow qualified names like System.Data.SqlClient.SqlCommand
+			if idx := strings.LastIndex(typeName, "."); idx >= 0 {
+				typeName = typeName[idx+1:]
+			}
+			if !adoCommandTypes[typeName] {
 				return
 			}
 			argList := findChild(node, "argument_list")
@@ -881,6 +901,151 @@ func extractStoredProcRefs(root *sitter.Node, src []byte, classRanges []classRan
 	})
 
 	return refs
+}
+
+// extractSQLVariableRefs finds SQL statements assigned to local variables or
+// fields — the dominant ADO.NET pattern in .NET Framework-era code:
+//
+//	string sql = "SELECT * FROM Customers WHERE Id = " + id;
+//	sql += " ORDER BY Name";
+//	cmd.CommandText = sql;
+//
+// A variable becomes a SQL source when first assigned a string starting with a
+// SQL verb; later += / self-concat appends to known SQL variables contribute
+// additional fragments. Only plain string expressions (literals and
+// concatenations) are considered; invocation results are left to
+// extractInlineSQLRefs to avoid double counting.
+func extractSQLVariableRefs(root *sitter.Node, src []byte, classRanges []classRange) []parser.RawReference {
+	var refs []parser.RawReference
+	sqlVars := map[string]bool{} // lowercased variable names known to hold SQL
+
+	emit := func(node *sitter.Node, name string, valueNode *sitter.Node, isAppend bool) {
+		if valueNode == nil || !isStringExpression(valueNode) {
+			return
+		}
+		sqlStr := collectStringParts(valueNode, src)
+		if sqlStr == "" {
+			return
+		}
+		key := strings.ToLower(name)
+		if isAppend {
+			// Appends only count for variables already known to hold SQL —
+			// "log += \" from the server\"" must not produce table refs.
+			if !sqlVars[key] {
+				return
+			}
+		} else {
+			if !startsWithSQLVerb(sqlStr) {
+				return
+			}
+			sqlVars[key] = true
+		}
+		line := int(node.StartPoint().Row) + 1
+		fromSymbol := findEnclosingClass(node, classRanges)
+		refs = append(refs, extractSQLTableRefs(sqlStr, line, fromSymbol)...)
+	}
+
+	walkTree(root, func(node *sitter.Node) {
+		switch node.Type() {
+		case "variable_declarator":
+			// shapes: (identifier "=" value) or (identifier (equals_value_clause value))
+			name := ""
+			var valueNode *sitter.Node
+			for i := 0; i < int(node.ChildCount()); i++ {
+				child := node.Child(i)
+				switch child.Type() {
+				case "identifier":
+					if name == "" {
+						name = child.Content(src)
+					}
+				case "equals_value_clause":
+					if child.ChildCount() > 0 {
+						valueNode = child.Child(int(child.ChildCount()) - 1)
+					}
+				case "string_literal", "verbatim_string_literal", "binary_expression":
+					valueNode = child
+				}
+			}
+			if name != "" {
+				emit(node, name, valueNode, false)
+			}
+
+		case "assignment_expression":
+			// sql = "..." / sql += "..." / sql = sql + "..." — plain identifiers
+			// only; member targets like cmd.CommandText are handled by
+			// extractStoredProcRefs.
+			left := node.Child(0)
+			if left == nil || left.Type() != "identifier" {
+				return
+			}
+			name := left.Content(src)
+			op := ""
+			if opNode := node.Child(1); opNode != nil {
+				op = opNode.Content(src)
+			}
+			valueNode := node.Child(int(node.ChildCount()) - 1)
+			isAppend := op == "+=" || isSelfConcat(valueNode, name, src)
+			emit(node, name, valueNode, isAppend)
+		}
+	})
+
+	return refs
+}
+
+// isSelfConcat reports whether value has the shape "name + ..." (the VB/C#
+// self-append idiom written without +=).
+func isSelfConcat(value *sitter.Node, name string, src []byte) bool {
+	if value == nil || value.Type() != "binary_expression" {
+		return false
+	}
+	left := value.Child(0)
+	return left != nil && left.Type() == "identifier" && left.Content(src) == name
+}
+
+// startsWithSQLVerb reports whether s begins with a SQL statement keyword.
+// This is stricter than looksLikeSQL, which matches keywords anywhere and
+// would treat prose like "loaded from the cache" as SQL.
+func startsWithSQLVerb(s string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(s))
+	for _, kw := range []string{"SELECT", "INSERT", "UPDATE", "DELETE", "EXEC", "EXECUTE", "MERGE", "TRUNCATE", "WITH"} {
+		if strings.HasPrefix(upper, kw+" ") {
+			return true
+		}
+	}
+	return false
+}
+
+// isStringExpression reports whether node is a string literal or a
+// concatenation expression (rather than e.g. an invocation result).
+func isStringExpression(node *sitter.Node) bool {
+	switch node.Type() {
+	case "string_literal", "verbatim_string_literal", "binary_expression":
+		return true
+	}
+	return false
+}
+
+// collectStringParts concatenates the contents of all string literals in an
+// expression, skipping literals inside argument lists (method call arguments).
+func collectStringParts(node *sitter.Node, src []byte) string {
+	var parts []string
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		switch n.Type() {
+		case "argument_list":
+			return // don't pick up strings passed to nested calls
+		case "string_literal", "verbatim_string_literal":
+			if s := extractStringLiteral(n, src); s != "" {
+				parts = append(parts, s)
+			}
+			return
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			walk(n.Child(i))
+		}
+	}
+	walk(node)
+	return strings.Join(parts, " ")
 }
 
 func extractStringLiteral(node *sitter.Node, src []byte) string {
