@@ -37,7 +37,9 @@ func ExtractTableRefs(sql string, line int, fromSymbol, defaultSchema string) []
 					ReferenceType: inferEdgeType(kw),
 					Line:          line,
 				}
-				if defaultSchema != "" {
+				if strings.Contains(tableName, ".") {
+					ref.ToQualified = tableName
+				} else if defaultSchema != "" {
 					ref.ToQualified = defaultSchema + "." + tableName
 				}
 				refs = append(refs, ref)

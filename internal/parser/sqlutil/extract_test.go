@@ -45,6 +45,12 @@ func TestExtractTableRefs_Exec(t *testing.T) {
 	assertHasRef(t, refs, "sp_GetOrders", "calls", "dbo.sp_GetOrders")
 }
 
+func TestExtractTableRefs_SchemaQualified(t *testing.T) {
+	refs := ExtractTableRefs("SELECT * FROM dbo.Users u JOIN audit.Log l ON l.UserID = u.ID", 1, "", "dbo")
+	assertHasRef(t, refs, "dbo.Users", "uses_table", "dbo.Users")
+	assertHasRef(t, refs, "audit.Log", "uses_table", "audit.Log")
+}
+
 func TestExtractTableRefs_NoSchema(t *testing.T) {
 	refs := ExtractTableRefs("SELECT * FROM users", 1, "", "")
 	if len(refs) != 1 {
