@@ -45,6 +45,9 @@ WHERE project_id = (SELECT id FROM projects WHERE slug = @project_slug)
 ORDER BY name
 LIMIT @lim;
 
+-- name: ListSymbolsByIDs :many
+SELECT * FROM symbols WHERE id = ANY(@ids::uuid[]);
+
 -- name: GetSymbolsByProject :many
 SELECT * FROM symbols WHERE project_id = $1 ORDER BY qualified_name LIMIT $2 OFFSET $3;
 

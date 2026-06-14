@@ -65,8 +65,12 @@ func (h *SearchSymbolsHandler) Handle(ctx context.Context, params SearchSymbolsP
 		languages = []string{}
 	}
 
+	// SearchSymbolsRanked orders exact name matches first (then prefix, then
+	// substring, with in-degree as tiebreak) BEFORE applying LIMIT. The plain
+	// SearchSymbols query orders alphabetically, which truncates away the most
+	// relevant matches on common substrings.
 	query := params.Query
-	results, err := h.store.SearchSymbols(ctx, postgres.SearchSymbolsParams{
+	results, err := h.store.SearchSymbolsRanked(ctx, postgres.SearchSymbolsRankedParams{
 		ProjectSlug: project.Slug,
 		Query:       &query,
 		Kinds:       kinds,

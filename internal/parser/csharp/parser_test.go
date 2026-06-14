@@ -925,6 +925,144 @@ namespace DotNetNuke.Modules {
 	}
 }
 
+func TestPersonaBarActionRoutedEndpoints(t *testing.T) {
+	// PersonaBar controllers use bare [HttpGet]/[HttpPost] (no path template) and
+	// rely on DNN's {controller}/{action} routing. Every method must therefore get
+	// a distinct method-level route rather than collapsing onto /<controller>.
+	src := `
+namespace Dnn.PersonaBar.SiteSettings.Services {
+    [MenuPermission(MenuName = "SiteSettings")]
+    public class SiteSettingsController : PersonaBarApiController {
+        [HttpGet]
+        public HttpResponseMessage GetPortalSettings(int portalId) {
+            return Request.CreateResponse(HttpStatusCode.OK);
+        }
+        [HttpPost]
+        public HttpResponseMessage UpdatePortalSettings(object request) {
+            return Request.CreateResponse(HttpStatusCode.OK);
+        }
+        [HttpPost]
+        public HttpResponseMessage UpdateMessagingSettings(object request) {
+            return Request.CreateResponse(HttpStatusCode.OK);
+        }
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "SiteSettingsController.cs", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	endpointMap := make(map[string]parser.Symbol)
+	for _, s := range result.Symbols {
+		if s.Kind == "endpoint" {
+			endpointMap[s.Signature] = s
+		}
+	}
+
+	wantRoutes := []string{
+		"GET /api/sitesettings/getportalsettings",
+		"POST /api/sitesettings/updateportalsettings",
+		"POST /api/sitesettings/updatemessagingsettings",
+	}
+	for _, want := range wantRoutes {
+		if _, ok := endpointMap[want]; !ok {
+			t.Errorf("missing method-level endpoint %q; have: %v", want, endpointMapKeys(endpointMap))
+		}
+	}
+}
+
+func TestStructuralActionRouting_NonDNNBase(t *testing.T) {
+	// An Umbraco-style controller: not a known DNN base, bare [HttpGet]/[HttpPost]
+	// with multiple same-verb methods. Structural detection (ambiguous bare verbs)
+	// must recognise action routing and produce method-level routes.
+	src := `
+namespace Umbraco.Cms.Web.BackOffice.Controllers {
+    public class ContentController : BackOfficeNotificationsController {
+        [HttpGet]
+        public IActionResult GetById(int id) => Ok();
+        [HttpGet]
+        public IActionResult GetByIds(int[] ids) => Ok();
+        [HttpPost]
+        public IActionResult PostSave(object model) => Ok();
+        [HttpPost]
+        public IActionResult PostPublish(object model) => Ok();
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "ContentController.cs", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoints := map[string]bool{}
+	for _, s := range result.Symbols {
+		if s.Kind == "endpoint" {
+			endpoints[s.Signature] = true
+		}
+	}
+	for _, want := range []string{
+		"GET /api/content/getbyid",
+		"GET /api/content/getbyids",
+		"POST /api/content/postsave",
+		"POST /api/content/postpublish",
+	} {
+		if !endpoints[want] {
+			t.Errorf("missing method-level endpoint %q; have: %v", want, keysOf(endpoints))
+		}
+	}
+}
+
+func TestStructuralActionRouting_RestControllerNotCollapsed(t *testing.T) {
+	// A genuine REST controller: each method has a distinct verb or an explicit
+	// template. No two bare methods share a verb, so it must NOT be treated as
+	// action-routed — the action name must not be appended.
+	src := `
+using Microsoft.AspNetCore.Mvc;
+namespace MyApp.Controllers {
+    [ApiController]
+    [Route("api/[controller]")]
+    public class OrdersController : ControllerBase {
+        [HttpGet]
+        public IActionResult GetAll() => Ok();
+        [HttpGet("{id}")]
+        public IActionResult GetById(int id) => Ok();
+        [HttpPost]
+        public IActionResult Create(object body) => Ok();
+    }
+}
+`
+	p := New()
+	result, err := p.Parse(parser.FileInput{Path: "OrdersController.cs", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoints := map[string]bool{}
+	for _, s := range result.Symbols {
+		if s.Kind == "endpoint" {
+			endpoints[s.Signature] = true
+		}
+	}
+	// REST routes preserved; no action-name appended.
+	for _, want := range []string{"GET /api/orders", "GET /api/orders/{id}", "POST /api/orders"} {
+		if !endpoints[want] {
+			t.Errorf("missing REST endpoint %q; have: %v", want, keysOf(endpoints))
+		}
+	}
+	if endpoints["GET /api/orders/getall"] {
+		t.Errorf("REST controller wrongly action-routed: %v", keysOf(endpoints))
+	}
+}
+
+func keysOf(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 // ---------------------------------------------------------------------------
 // ASP.NET Core endpoint extraction tests
 // ---------------------------------------------------------------------------

@@ -30,7 +30,6 @@ services:
       - "7687:7687"
     volumes:
       - neo4jdata:/data
-      - ./migrations/neo4j:/var/lib/neo4j/import
     healthcheck:
       test: ["CMD", "neo4j", "status"]
       interval: 10s
@@ -108,7 +107,7 @@ services:
     entrypoint: >
       sh -c "cat /import/init.cypher | cypher-shell -a bolt://neo4j:7687 -u ${NEO4J_USER} -p ${NEO4J_PASSWORD}"
     volumes:
-      - ./migrations/neo4j:/import
+      - ./migrations/neo4j:/import:ro
     depends_on:
       neo4j:
         condition: service_healthy
