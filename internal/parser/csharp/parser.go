@@ -1692,12 +1692,18 @@ var aspVerbAttrs = map[string]string{
 func extractASPNetEndpoints(root *sitter.Node, src []byte, ns string) []parser.Symbol {
 	var endpoints []parser.Symbol
 
-	// DNN controller base classes that indicate an API controller.
+	// Controller base classes whose frameworks route by action name
+	// ({controller}/{action}) rather than by HTTP verb alone. DNN's Web API
+	// stack (and the PersonaBar that builds on it) registers such routes, so a
+	// bare [HttpGet]/[HttpPost] resolves to /<controller>/<method>, not just
+	// /<controller>. This list is the trigger for appending the action segment;
+	// extend it for other action-routed frameworks.
 	dnnControllerBases := map[string]bool{
-		"DnnApiController":      true,
-		"DnnController":         true,
+		"DnnApiController":       true,
+		"DnnController":          true,
 		"ServicesApiController":  true,
-		"DnnModuleController":   true,
+		"DnnModuleController":    true,
+		"PersonaBarApiController": true,
 	}
 
 	// DNN return types that indicate an API endpoint method.
@@ -1783,6 +1789,15 @@ func extractASPNetEndpoints(root *sitter.Node, src []byte, ns string) []parser.S
 			return
 		}
 
+		// Determine whether this controller is action-routed ({controller}/{action})
+		// rather than verb-routed REST. A known action-routing base class is one
+		// signal; the other is structural and framework-agnostic: two or more
+		// methods sharing an HTTP verb with no method-level route template cannot
+		// coexist under verb routing (the routes would be ambiguous), so the
+		// framework must disambiguate by action name. Detecting this structurally
+		// means new action-routed frameworks work without being added to a list.
+		actionRouted := info.isDNN || hasAmbiguousBareVerbs(body, src)
+
 		for i := 0; i < int(body.ChildCount()); i++ {
 			member := body.Child(i)
 			if member.Type() != "method_declaration" {
@@ -1830,6 +1845,14 @@ func extractASPNetEndpoints(root *sitter.Node, src []byte, ns string) []parser.S
 
 					methodPath := extractAttrStringParam(attr, src)
 
+					// Action-routed controllers with a bare verb attribute resolve
+					// to {controller}/{action}; supply the method name as the action
+					// segment so the route is method-level rather than collapsing
+					// every method onto /<controller>.
+					if methodPath == "" && actionRouted {
+						methodPath = strings.ToLower(methodName)
+					}
+
 					// Build final routes by combining base paths with method path
 					for _, basePath := range info.basePaths {
 						route := buildRoute(verb, basePath, methodPath, strings.TrimSuffix(className, "Controller"), methodName)
@@ -1870,6 +1893,46 @@ func extractASPNetEndpoints(root *sitter.Node, src []byte, ns string) []parser.S
 	})
 
 	return endpoints
+}
+
+// hasAmbiguousBareVerbs reports whether a controller body contains two or more
+// methods that share an HTTP verb and have no method-level route template. Under
+// verb-based REST routing such methods would produce ambiguous routes, so their
+// presence indicates the controller is action-routed ({controller}/{action}) and
+// the framework disambiguates by method name. This is the framework-agnostic
+// signal for action routing — it needs no knowledge of specific base classes.
+func hasAmbiguousBareVerbs(body *sitter.Node, src []byte) bool {
+	bareByVerb := map[string]int{}
+	for i := 0; i < int(body.ChildCount()); i++ {
+		member := body.Child(i)
+		if member.Type() != "method_declaration" {
+			continue
+		}
+		for j := 0; j < int(member.ChildCount()); j++ {
+			mc := member.Child(j)
+			if mc.Type() != "attribute_list" {
+				continue
+			}
+			walkTree(mc, func(attr *sitter.Node) {
+				if attr.Type() != "attribute" {
+					return
+				}
+				verb, isRoutingAttr := aspVerbAttrs[extractAttrName(attr, src)]
+				if !isRoutingAttr || verb == "" {
+					return
+				}
+				if extractAttrStringParam(attr, src) == "" {
+					bareByVerb[verb]++
+				}
+			})
+		}
+	}
+	for _, n := range bareByVerb {
+		if n >= 2 {
+			return true
+		}
+	}
+	return false
 }
 
 // buildRoute combines an HTTP verb, a controller base path, and a method-level

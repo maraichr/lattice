@@ -269,3 +269,68 @@ func TestNormalizeRouteForMatch(t *testing.T) {
 		}
 	}
 }
+
+func TestRouteMatches_SuffixAndPrefix(t *testing.T) {
+	cases := []struct {
+		name     string
+		ref, sig string
+		want     bool
+	}{
+		{"exact", "get /api/users/{p}", "get /api/users/{p}", true},
+		{"client omits api root", "get sitesettings/getportalsettings", "get /api/sitesettings/getportalsettings", true},
+		{"client omits api + module root present on client", "get personabar/sitesettings/getportalsettings", "get /api/sitesettings/getportalsettings", true},
+		{"verb mismatch", "post sitesettings/getportalsettings", "get /api/sitesettings/getportalsettings", false},
+		{"single segment does not over-match", "get getportalsettings", "get /api/sitesettings/getportalsettings", false},
+		{"different controller", "get foo/getportalsettings", "get /api/sitesettings/getportalsettings", false},
+		{"different action", "get sitesettings/deletex", "get /api/sitesettings/getportalsettings", false},
+		{"refless verb matches any", "users/{p}", "get /api/users/{p}", true},
+		{"version root stripped", "get orders/{p}", "get /v2/orders/{p}", true},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := routeMatches(normalizeRouteForMatch(tt.ref), normalizeRouteForMatch(tt.sig))
+			if got != tt.want {
+				t.Errorf("routeMatches(%q, %q) = %v, want %v", tt.ref, tt.sig, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMatchesLanguage_CanonicalAliases(t *testing.T) {
+	cases := []struct {
+		actual, pattern string
+		want            bool
+	}{
+		{"js", "javascript", true},
+		{"jsx", "javascript", true},
+		{"mjs", "javascript", true},
+		{"ts", "typescript", true},
+		{"tsx", "typescript", true},
+		{"cs", "csharp", true},
+		{"javascript", "javascript", true},
+		{"js", "typescript", false},
+		{"cs", "tsql", false},
+	}
+	for _, tt := range cases {
+		if got := matchesLanguage(tt.actual, tt.pattern); got != tt.want {
+			t.Errorf("matchesLanguage(%q, %q) = %v, want %v", tt.actual, tt.pattern, got, tt.want)
+		}
+	}
+}
+
+func TestRouteMatches_PluralTolerance(t *testing.T) {
+	cases := []struct {
+		ref, sig string
+		want     bool
+	}{
+		{"post user/postclearavatar", "post /api/users/postclearavatar", true},  // singular key, plural controller
+		{"get users/getbyid", "get /api/user/getbyid", true},                    // reverse
+		{"get content/getbyid", "get /api/content/getbyid", true},               // exact still works
+		{"get foo/getbyid", "get /api/bar/getbyid", false},                      // unrelated still rejected
+	}
+	for _, tt := range cases {
+		if got := routeMatches(normalizeRouteForMatch(tt.ref), normalizeRouteForMatch(tt.sig)); got != tt.want {
+			t.Errorf("routeMatches(%q,%q)=%v want %v", tt.ref, tt.sig, got, tt.want)
+		}
+	}
+}

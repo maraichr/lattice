@@ -342,6 +342,47 @@ func (q *Queries) ListSymbolsByFileIDs(ctx context.Context, dollar_1 []uuid.UUID
 	return items, nil
 }
 
+const listSymbolsByIDs = `-- name: ListSymbolsByIDs :many
+SELECT id, project_id, file_id, name, qualified_name, kind, language, start_line, end_line, start_col, end_col, signature, doc_comment, metadata, created_at, updated_at FROM symbols WHERE id = ANY($1::uuid[])
+`
+
+func (q *Queries) ListSymbolsByIDs(ctx context.Context, ids []uuid.UUID) ([]Symbol, error) {
+	rows, err := q.db.Query(ctx, listSymbolsByIDs, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Symbol{}
+	for rows.Next() {
+		var i Symbol
+		if err := rows.Scan(
+			&i.ID,
+			&i.ProjectID,
+			&i.FileID,
+			&i.Name,
+			&i.QualifiedName,
+			&i.Kind,
+			&i.Language,
+			&i.StartLine,
+			&i.EndLine,
+			&i.StartCol,
+			&i.EndCol,
+			&i.Signature,
+			&i.DocComment,
+			&i.Metadata,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSymbolsByNames = `-- name: ListSymbolsByNames :many
 SELECT id, project_id, file_id, name, qualified_name, kind, language, start_line, end_line, start_col, end_col, signature, doc_comment, metadata, created_at, updated_at FROM symbols WHERE project_id = $1 AND name = ANY($2::text[])
 `

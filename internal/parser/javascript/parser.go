@@ -46,9 +46,18 @@ func (p *Parser) Parse(input parser.FileInput) (*parser.ParseResult, error) {
 	var symbols []parser.Symbol
 	var refs []parser.RawReference
 
+	// JavaScript/TypeScript have no language-level namespace: the module (file)
+	// is the scope. Without a per-file prefix, short top-level names like
+	// `rootReducer`, `index`, or an `actions` object collide across the hundreds
+	// of files that legitimately reuse them, and the (project_id, qualified_name,
+	// kind) upsert collapses them to a single row. We scope bare top-level names
+	// by the module path. Names that are already dotted (legacy global namespaces
+	// like `dnn.dom.positioning`, prototype methods) are left global.
+	moduleScope := moduleScopeFromPath(input.Path)
+
 	for i := 0; i < int(root.ChildCount()); i++ {
 		child := root.Child(i)
-		syms, rfs := p.extractTopLevel(child, input.Content, "")
+		syms, rfs := p.extractTopLevel(child, input.Content, moduleScope)
 		symbols = append(symbols, syms...)
 		refs = append(refs, rfs...)
 	}
@@ -59,12 +68,76 @@ func (p *Parser) Parse(input parser.FileInput) (*parser.ParseResult, error) {
 
 	// Post-extraction pass: detect outbound HTTP API calls (fetch, axios, http, etc.)
 	apiRefs := p.extractAPICallRefs(root, input.Content, symbols)
-	refs = append(refs, apiRefs...)
+
+	// Post-extraction passes: reconstruct routes for configured service clients
+	// (axios instances, base-path objects, in-file factories) and for the
+	// URL-builder dialect (http.verb(getApiUrl(base, action))). These can emit a
+	// fuller route for a call the generic pass also matched, so all three are
+	// reconciled keeping the more-qualified (more path segments) reference.
+	clientRefs := p.extractServiceClientAPIRefs(root, input.Content, symbols)
+	urlBuilderRefs := p.extractURLBuilderAPIRefs(root, input.Content, symbols)
+	reconstructed := append(clientRefs, urlBuilderRefs...)
+	refs = append(refs, dedupeAPIRefs(apiRefs, reconstructed)...)
 
 	return &parser.ParseResult{
 		Symbols:    symbols,
 		References: refs,
 	}, nil
+}
+
+// dedupeAPIRefs merges generic and reconstructed calls_api references. When both
+// passes produced a reference for the same caller and line, the one with more
+// path segments wins (the reconstructed route carries the base path the generic
+// pass could not see). Non-calls_api refs and refs at distinct sites pass through.
+func dedupeAPIRefs(generic, reconstructed []parser.RawReference) []parser.RawReference {
+	type key struct {
+		from string
+		line int
+	}
+	best := map[key]parser.RawReference{}
+	var order []key
+
+	consider := func(r parser.RawReference) {
+		if r.ReferenceType != "calls_api" {
+			return
+		}
+		k := key{r.FromSymbol, r.Line}
+		existing, ok := best[k]
+		if !ok {
+			best[k] = r
+			order = append(order, k)
+			return
+		}
+		if routeSegmentCount(r.ToName) > routeSegmentCount(existing.ToName) {
+			best[k] = r
+		}
+	}
+	for _, r := range generic {
+		consider(r)
+	}
+	for _, r := range reconstructed {
+		consider(r)
+	}
+
+	out := make([]parser.RawReference, 0, len(order))
+	for _, k := range order {
+		out = append(out, best[k])
+	}
+	return out
+}
+
+// routeSegmentCount counts path segments in a "VERB path/with/segments" route.
+func routeSegmentCount(route string) int {
+	if idx := strings.IndexByte(route, ' '); idx >= 0 {
+		route = route[idx+1:]
+	}
+	n := 0
+	for _, s := range strings.Split(route, "/") {
+		if strings.TrimSpace(s) != "" {
+			n++
+		}
+	}
+	return n
 }
 
 func (p *Parser) extractTopLevel(node *sitter.Node, src []byte, scope string) ([]parser.Symbol, []parser.RawReference) {
@@ -99,12 +172,347 @@ func (p *Parser) extractTopLevel(node *sitter.Node, src []byte, scope string) ([
 		return []parser.Symbol{sym}, nil
 
 	case "expression_statement":
-		// Check for require() calls: module.exports = require(...)
-		rfs := p.extractRequireFromExpression(node, src)
-		return nil, rfs
+		return p.extractExpressionStatement(node, src, scope)
 	}
 
 	return nil, nil
+}
+
+// extractExpressionStatement handles top-level statements that define symbols
+// without declaration syntax: namespace assignments (dnn.controls.x = {...}),
+// prototype methods (Foo.prototype.bar = function), CommonJS exports, IIFE
+// modules ((function($){...})(jQuery)), and AMD define() calls. These are the
+// dominant idioms in pre-ES6 codebases.
+func (p *Parser) extractExpressionStatement(node *sitter.Node, src []byte, scope string) ([]parser.Symbol, []parser.RawReference) {
+	// require() side-effects anywhere in the statement
+	refs := p.extractRequireFromExpression(node, src)
+	var symbols []parser.Symbol
+
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		switch child.Type() {
+		case "assignment_expression":
+			syms, rfs := p.extractAssignment(child, src, scope)
+			symbols = append(symbols, syms...)
+			refs = append(refs, rfs...)
+		case "call_expression":
+			syms, rfs := p.extractModuleCall(child, src, scope)
+			symbols = append(symbols, syms...)
+			refs = append(refs, rfs...)
+		}
+	}
+
+	return symbols, refs
+}
+
+// extractAssignment turns `lhs = function/object` statements into symbols.
+func (p *Parser) extractAssignment(node *sitter.Node, src []byte, scope string) ([]parser.Symbol, []parser.RawReference) {
+	left := node.ChildByFieldName("left")
+	right := node.ChildByFieldName("right")
+	if left == nil || right == nil {
+		return nil, nil
+	}
+
+	name, qname, kind := assignmentTarget(left, src, scope)
+	if name == "" {
+		return nil, nil
+	}
+
+	startLine := int(node.StartPoint().Row) + 1
+	endLine := int(node.EndPoint().Row) + 1
+
+	switch right.Type() {
+	case "arrow_function", "function", "function_expression":
+		sig := ""
+		if params := findChild(right, "formal_parameters"); params != nil {
+			sig = params.Content(src)
+		}
+		if kind == "" {
+			kind = "function"
+		}
+		return []parser.Symbol{{
+			Name:          name,
+			QualifiedName: qname,
+			Kind:          kind,
+			Language:      p.lang,
+			StartLine:     startLine,
+			EndLine:       endLine,
+			Signature:     sig,
+		}}, nil
+
+	case "object":
+		// Namespace object: emit the container plus its function-valued members.
+		symbols := []parser.Symbol{{
+			Name:          name,
+			QualifiedName: qname,
+			Kind:          "module",
+			Language:      p.lang,
+			StartLine:     startLine,
+			EndLine:       endLine,
+		}}
+		symbols = append(symbols, p.extractObjectMembers(right, src, qname)...)
+		return symbols, nil
+
+	case "call_expression":
+		// Revealing module: ns.x = (function(){ ... })(). Emit the container and
+		// recurse into the IIFE body so inner declarations become its members.
+		if body := iifeBody(right); body != nil {
+			symbols := []parser.Symbol{{
+				Name:          name,
+				QualifiedName: qname,
+				Kind:          "module",
+				Language:      p.lang,
+				StartLine:     startLine,
+				EndLine:       endLine,
+			}}
+			var refs []parser.RawReference
+			for i := 0; i < int(body.ChildCount()); i++ {
+				syms, rfs := p.extractTopLevel(body.Child(i), src, qname)
+				symbols = append(symbols, syms...)
+				refs = append(refs, rfs...)
+			}
+			return symbols, refs
+		}
+	}
+
+	return nil, nil
+}
+
+// assignmentTarget interprets the LHS of a top-level assignment. Returns empty
+// name for targets that don't define a durable symbol (this.x, computed, locals).
+func assignmentTarget(left *sitter.Node, src []byte, scope string) (name, qname, kind string) {
+	switch left.Type() {
+	case "member_expression":
+		full := left.Content(src)
+		if strings.Contains(full, "this.") || strings.Contains(full, "[") {
+			return "", "", ""
+		}
+		parts := strings.Split(full, ".")
+		// CommonJS: module.exports / exports.foo
+		if parts[0] == "module" && len(parts) >= 2 && parts[1] == "exports" {
+			if len(parts) == 2 {
+				return "", "", "" // anonymous module.exports = ... (members still useful via object path below, but skip container)
+			}
+			name = parts[len(parts)-1]
+			return name, qualify(scope, name), ""
+		}
+		if parts[0] == "exports" && len(parts) == 2 {
+			return parts[1], qualify(scope, parts[1]), ""
+		}
+		// Prototype method: Foo.prototype.bar → Foo.bar (method)
+		for i, seg := range parts {
+			if seg == "prototype" && i >= 1 && i < len(parts)-1 {
+				owner := strings.Join(parts[:i], ".")
+				name = parts[len(parts)-1]
+				return name, qualify(scope, owner+"."+name), "method"
+			}
+		}
+		// window.Foo → Foo
+		if parts[0] == "window" && len(parts) >= 2 {
+			parts = parts[1:]
+		}
+		name = parts[len(parts)-1]
+		return name, qualify(scope, strings.Join(parts, ".")), ""
+
+	case "identifier":
+		// Bare `foo = ...` at top level: only meaningful if it defines a function.
+		name = left.Content(src)
+		return name, qualify(scope, name), ""
+	}
+	return "", "", ""
+}
+
+// extractModuleCall handles top-level call statements that wrap module code:
+// IIFEs and AMD define([deps], factory).
+func (p *Parser) extractModuleCall(node *sitter.Node, src []byte, scope string) ([]parser.Symbol, []parser.RawReference) {
+	var symbols []parser.Symbol
+	var refs []parser.RawReference
+
+	// AMD: define(["dep", ...], function(...) { body })
+	if fn := findChild(node, "identifier"); fn != nil && fn.Content(src) == "define" {
+		if args := findChild(node, "arguments"); args != nil {
+			for i := 0; i < int(args.ChildCount()); i++ {
+				arg := args.Child(i)
+				switch arg.Type() {
+				case "array":
+					for j := 0; j < int(arg.ChildCount()); j++ {
+						if dep := arg.Child(j); dep.Type() == "string" {
+							if s := extractStringContent(dep, src); s != "" {
+								refs = append(refs, parser.RawReference{
+									ToName:        s,
+									ReferenceType: "imports",
+									Line:          int(dep.StartPoint().Row) + 1,
+								})
+							}
+						}
+					}
+				case "function", "function_expression", "arrow_function":
+					if body := findChild(arg, "statement_block"); body != nil {
+						for j := 0; j < int(body.ChildCount()); j++ {
+							syms, rfs := p.extractTopLevel(body.Child(j), src, scope)
+							symbols = append(symbols, syms...)
+							refs = append(refs, rfs...)
+						}
+					}
+				}
+			}
+		}
+		return symbols, refs
+	}
+
+	// IIFE: (function(...) { body })(...)
+	if body := iifeBody(node); body != nil {
+		for i := 0; i < int(body.ChildCount()); i++ {
+			syms, rfs := p.extractTopLevel(body.Child(i), src, scope)
+			symbols = append(symbols, syms...)
+			refs = append(refs, rfs...)
+		}
+		return symbols, refs
+	}
+
+	// Mixin/factory calls that attach an object of members to a named target:
+	//   $.widget("ui.form", {...})          (jQuery UI)
+	//   dnn.extend(dnn.dom.positioning, {...})  (MS Ajax / DNN)
+	//   Object.assign(MyNamespace, {...})
+	symbols = append(symbols, p.extractMixinCall(node, src, scope)...)
+
+	return symbols, refs
+}
+
+// extractMixinCall handles widget/extend/assign-style calls whose effect is to
+// define members on a named object. The target is the first string or
+// member-expression argument; the members come from the first object literal
+// that follows it.
+func (p *Parser) extractMixinCall(node *sitter.Node, src []byte, scope string) []parser.Symbol {
+	callee := node.ChildByFieldName("function")
+	if callee == nil {
+		return nil
+	}
+
+	// Method name is the last identifier of the callee.
+	calleeText := callee.Content(src)
+	methodName := calleeText
+	if idx := strings.LastIndex(calleeText, "."); idx >= 0 {
+		methodName = calleeText[idx+1:]
+	}
+	switch methodName {
+	case "widget", "extend", "assign", "registerClass", "mix", "mixin":
+	default:
+		return nil
+	}
+
+	args := findChild(node, "arguments")
+	if args == nil {
+		return nil
+	}
+
+	// Locate the target (first string or member_expression arg) and the member
+	// object (first object literal after the target).
+	target := ""
+	targetLine := 0
+	var memberObj *sitter.Node
+	for i := 0; i < int(args.ChildCount()); i++ {
+		arg := args.Child(i)
+		switch arg.Type() {
+		case "string":
+			if target == "" {
+				target = extractStringContent(arg, src)
+				targetLine = int(arg.StartPoint().Row) + 1
+			}
+		case "member_expression", "identifier":
+			if target == "" {
+				target = arg.Content(src)
+				targetLine = int(arg.StartPoint().Row) + 1
+			}
+		case "object":
+			if target != "" && memberObj == nil {
+				memberObj = arg
+			}
+		}
+	}
+	if target == "" || memberObj == nil || strings.Contains(target, "[") {
+		return nil
+	}
+
+	qname := qualify(scope, target)
+	name := target
+	if idx := strings.LastIndex(target, "."); idx >= 0 {
+		name = target[idx+1:]
+	}
+
+	symbols := []parser.Symbol{{
+		Name:          name,
+		QualifiedName: qname,
+		Kind:          "module",
+		Language:      p.lang,
+		StartLine:     targetLine,
+		EndLine:       int(node.EndPoint().Row) + 1,
+	}}
+	symbols = append(symbols, p.extractObjectMembers(memberObj, src, qname)...)
+	return symbols
+}
+
+// iifeBody returns the statement_block of an immediately-invoked function
+// expression call node, or nil if the node is not an IIFE.
+func iifeBody(call *sitter.Node) *sitter.Node {
+	if call.Type() != "call_expression" {
+		return nil
+	}
+	callee := call.ChildByFieldName("function")
+	if callee == nil {
+		return nil
+	}
+	if callee.Type() == "parenthesized_expression" {
+		for i := 0; i < int(callee.ChildCount()); i++ {
+			inner := callee.Child(i)
+			switch inner.Type() {
+			case "function", "function_expression", "arrow_function":
+				return findChild(inner, "statement_block")
+			}
+		}
+	}
+	return nil
+}
+
+// extractObjectMembers emits function-valued properties of an object literal as
+// member symbols: { foo() {} }, { foo: function() {} }, { foo: () => {} }.
+func (p *Parser) extractObjectMembers(obj *sitter.Node, src []byte, parentQName string) []parser.Symbol {
+	var symbols []parser.Symbol
+	for i := 0; i < int(obj.ChildCount()); i++ {
+		child := obj.Child(i)
+		switch child.Type() {
+		case "pair":
+			key := child.ChildByFieldName("key")
+			value := child.ChildByFieldName("value")
+			if key == nil || value == nil {
+				continue
+			}
+			switch value.Type() {
+			case "arrow_function", "function", "function_expression":
+				name := strings.Trim(key.Content(src), `"'`)
+				sig := ""
+				if params := findChild(value, "formal_parameters"); params != nil {
+					sig = params.Content(src)
+				}
+				symbols = append(symbols, parser.Symbol{
+					Name:          name,
+					QualifiedName: parentQName + "." + name,
+					Kind:          "method",
+					Language:      p.lang,
+					StartLine:     int(child.StartPoint().Row) + 1,
+					EndLine:       int(child.EndPoint().Row) + 1,
+					Signature:     sig,
+				})
+			}
+		case "method_definition":
+			// Shorthand: { loadPage(id) { ... } }
+			sym, _ := p.extractMethodDef(child, src, parentQName)
+			if sym.Name != "" {
+				symbols = append(symbols, sym)
+			}
+		}
+	}
+	return symbols
 }
 
 // --- Function declarations ---
@@ -171,10 +579,11 @@ func (p *Parser) extractClassDecl(node *sitter.Node, src []byte, scope string) (
 		}
 	}
 
-	// Class body members
+	// Class body members inherit the class's (scoped) qualified name so that
+	// members of same-named classes in different modules don't collide.
 	body := findChild(node, "class_body")
 	if body != nil {
-		memberSyms, memberRefs := p.extractClassMembers(body, src, name)
+		memberSyms, memberRefs := p.extractClassMembers(body, src, qname)
 		symbols = append(symbols, memberSyms...)
 		refs = append(refs, memberRefs...)
 	}
@@ -362,48 +771,82 @@ func (p *Parser) extractVarDecl(node *sitter.Node, src []byte, scope string) ([]
 	var symbols []parser.Symbol
 	var refs []parser.RawReference
 
+	isConst := node.ChildCount() > 0 && node.Child(0).Type() == "const"
+
 	walkChildren(node, func(child *sitter.Node) {
 		if child.Type() != "variable_declarator" {
 			return
 		}
 
 		name := ""
-		isArrow := false
-		for j := 0; j < int(child.ChildCount()); j++ {
-			gc := child.Child(j)
-			if gc.Type() == "identifier" && name == "" {
-				name = gc.Content(src)
-			}
-			if gc.Type() == "arrow_function" || gc.Type() == "function" || gc.Type() == "function_expression" {
-				isArrow = true
-			}
+		if nameNode := child.ChildByFieldName("name"); nameNode != nil && nameNode.Type() == "identifier" {
+			name = nameNode.Content(src)
 		}
-
 		if name == "" {
-			return
+			return // destructuring or computed — no single symbol to define
 		}
 
 		// Check for require() calls
 		reqRef := p.extractRequireFromDeclarator(child, src)
 		if reqRef != nil {
 			refs = append(refs, *reqRef)
+			return // const x = require('y') is an import binding, not a definition
 		}
 
-		if isArrow {
+		value := child.ChildByFieldName("value")
+		startLine := int(node.StartPoint().Row) + 1
+		endLine := int(node.EndPoint().Row) + 1
+
+		valueType := ""
+		if value != nil {
+			valueType = value.Type()
+		}
+
+		switch valueType {
+		case "arrow_function", "function", "function_expression":
 			sig := ""
-			walkTree(child, func(n *sitter.Node) {
-				if n.Type() == "formal_parameters" && sig == "" {
-					sig = n.Content(src)
-				}
-			})
+			if params := findChild(value, "formal_parameters"); params != nil {
+				sig = params.Content(src)
+			}
 			symbols = append(symbols, parser.Symbol{
 				Name:          name,
 				QualifiedName: qualify(scope, name),
 				Kind:          "function",
 				Language:      p.lang,
-				StartLine:     int(node.StartPoint().Row) + 1,
-				EndLine:       int(node.EndPoint().Row) + 1,
+				StartLine:     startLine,
+				EndLine:       endLine,
 				Signature:     sig,
+			})
+
+		case "object":
+			// Object literal: a constant map (action types) or a behaviour module
+			// (Redux actions). Emit the container and its function members.
+			qname := qualify(scope, name)
+			symbols = append(symbols, parser.Symbol{
+				Name:          name,
+				QualifiedName: qname,
+				Kind:          "constant",
+				Language:      p.lang,
+				StartLine:     startLine,
+				EndLine:       endLine,
+			})
+			symbols = append(symbols, p.extractObjectMembers(value, src, qname)...)
+
+		default:
+			// Any other initializer (call results like combineReducers(...),
+			// literals, JSX, class expressions). Top-level declarations are the
+			// module's surface — record them so the file is represented.
+			kind := "variable"
+			if isConst {
+				kind = "constant"
+			}
+			symbols = append(symbols, parser.Symbol{
+				Name:          name,
+				QualifiedName: qualify(scope, name),
+				Kind:          kind,
+				Language:      p.lang,
+				StartLine:     startLine,
+				EndLine:       endLine,
 			})
 		}
 	})
@@ -1011,11 +1454,32 @@ func extractDecoratorName(node *sitter.Node, src []byte) string {
 
 // --- Helpers ---
 
+// qualify prefixes a bare top-level name with the module scope. A name that is
+// already dotted (e.g. a legacy global namespace `dnn.dom.positioning`, a
+// prototype target `Foo.bar`, or a widget key `ui.form`) is treated as globally
+// addressable and returned unchanged — module-scoping it would both be wrong
+// (these names are shared by design) and break cross-file resolution.
 func qualify(scope, name string) string {
-	if scope != "" {
-		return scope + "." + name
+	if scope == "" || strings.Contains(name, ".") {
+		return name
 	}
-	return name
+	return scope + "." + name
+}
+
+// moduleScopeFromPath derives a stable, file-unique scope from a source path by
+// dropping the extension and normalising separators. The path is relative to the
+// repository root and stable across re-indexes, so symbol IDs remain stable.
+func moduleScopeFromPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	p := strings.ReplaceAll(path, "\\", "/")
+	if idx := strings.LastIndexByte(p, '.'); idx >= 0 {
+		if slash := strings.LastIndexByte(p, '/'); idx > slash {
+			p = p[:idx]
+		}
+	}
+	return p
 }
 
 func findChild(node *sitter.Node, nodeType string) *sitter.Node {

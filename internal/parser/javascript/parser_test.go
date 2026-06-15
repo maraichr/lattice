@@ -648,10 +648,19 @@ function loadUsers() {
 
 // --- helpers ---
 
+// assertHasSymbol checks for a symbol by its module-local qualified name. Because
+// JS/TS top-level symbols are now scoped by module path (e.g. "utils.fetchUsers"
+// for utils.js), an assertion on the local name "fetchUsers" matches either an
+// exact qualified name (dotted globals like "dnn.dom.positioning") or one ending
+// in ".<local>" (module-scoped names). The leading dot keeps the suffix match on
+// a name boundary so "Role" does not match "UserRole".
 func assertHasSymbol(t *testing.T, symbols []parser.Symbol, qname, kind string) {
 	t.Helper()
 	for _, s := range symbols {
-		if s.QualifiedName == qname && s.Kind == kind {
+		if s.Kind != kind {
+			continue
+		}
+		if s.QualifiedName == qname || strings.HasSuffix(s.QualifiedName, "."+qname) {
 			return
 		}
 	}
@@ -684,4 +693,364 @@ func assertRefTarget(t *testing.T, refs []parser.RawReference, target string) {
 		names[i] = r.ToName
 	}
 	t.Errorf("missing ref target %s; have: %v", target, names)
+}
+
+// --- Legacy and module-pattern tests (DNN-style codebases) ---
+
+func TestJSTopLevelConstant(t *testing.T) {
+	src := `export const PAGE_ACTIONS = { LOAD: "LOAD_PAGE", SAVE: "SAVE_PAGE" };`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "pageActionTypes.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHasSymbol(t, result.Symbols, "PAGE_ACTIONS", "constant")
+}
+
+func TestJSConstFromCallExpression(t *testing.T) {
+	src := `
+import { combineReducers } from "redux";
+import pagination from "./paginationReducer";
+const rootReducer = combineReducers({ pagination });
+export default rootReducer;
+`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "rootReducer.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHasSymbol(t, result.Symbols, "rootReducer", "constant")
+	imports := filterRefs(result.References, "imports")
+	if len(imports) != 2 {
+		t.Errorf("expected 2 import refs, got %d", len(imports))
+	}
+}
+
+func TestJSObjectLiteralMethods(t *testing.T) {
+	src := `
+const pageActions = {
+  loadPage(id) { return id; },
+  savePage: function(p) { return p; },
+  deletePage: (id) => id,
+};
+export default pageActions;
+`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "pageActions.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHasSymbol(t, result.Symbols, "pageActions", "constant")
+	assertHasSymbol(t, result.Symbols, "pageActions.loadPage", "method")
+	assertHasSymbol(t, result.Symbols, "pageActions.savePage", "method")
+	assertHasSymbol(t, result.Symbols, "pageActions.deletePage", "method")
+}
+
+func TestJSNamespaceAssignment(t *testing.T) {
+	src := `dnn.controls.dnnrichtext = { init: function(ctl) { return ctl; } };`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "dnn.controls.dnnrichtext.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHasSymbol(t, result.Symbols, "dnn.controls.dnnrichtext", "module")
+	assertHasSymbol(t, result.Symbols, "dnn.controls.dnnrichtext.init", "method")
+}
+
+func TestJSPrototypeMethod(t *testing.T) {
+	src := `DnnMotion.prototype.startAnimation = function (el) { return el; };`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "dnn.motion.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHasSymbol(t, result.Symbols, "DnnMotion.startAnimation", "method")
+}
+
+func TestJSIIFEModule(t *testing.T) {
+	src := `
+(function ($) {
+  function setupActions(menu) { return menu; }
+  $.fn.moduleActions = function () { return setupActions(this); };
+})(jQuery);
+`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "ModuleActions.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHasSymbol(t, result.Symbols, "setupActions", "function")
+	assertHasSymbol(t, result.Symbols, "$.fn.moduleActions", "function")
+}
+
+func TestJSRevealingModule(t *testing.T) {
+	src := `
+dnn.dom.positioning = (function () {
+  function elementPos(e) { return e; }
+  return { elementPos: elementPos };
+})();
+`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "dnn.dom.positioning.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHasSymbol(t, result.Symbols, "dnn.dom.positioning", "module")
+	assertHasSymbol(t, result.Symbols, "dnn.dom.positioning.elementPos", "function")
+}
+
+func TestJSAMDDefine(t *testing.T) {
+	src := `
+define(["jquery", "knockout"], function ($, ko) {
+  function bindModel(vm) { return vm; }
+  return { bindModel: bindModel };
+});
+`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "viewmodel.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHasSymbol(t, result.Symbols, "bindModel", "function")
+	imports := filterRefs(result.References, "imports")
+	if len(imports) != 2 {
+		t.Errorf("expected 2 AMD dep imports, got %d", len(imports))
+	}
+}
+
+func TestJSCommonJSExports(t *testing.T) {
+	src := `
+exports.formatDate = function (d) { return d.toISOString(); };
+module.exports.parseDate = (s) => new Date(s);
+`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "dates.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHasSymbol(t, result.Symbols, "formatDate", "function")
+	assertHasSymbol(t, result.Symbols, "parseDate", "function")
+}
+
+func TestJSRequireBindingIsNotASymbol(t *testing.T) {
+	src := `const express = require("express");`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "app.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Symbols) != 0 {
+		t.Errorf("require binding should not create symbols, got %v", result.Symbols)
+	}
+	imports := filterRefs(result.References, "imports")
+	if len(imports) != 1 {
+		t.Errorf("expected 1 import ref, got %d", len(imports))
+	}
+}
+
+func TestJSJQueryWidgetFactory(t *testing.T) {
+	src := `
+$.widget("ui.form", {
+    _init: function () { return this; },
+    buttons: function (element) { return element; },
+});
+`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "jquery.ui.controls.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHasSymbol(t, result.Symbols, "ui.form", "module")
+	assertHasSymbol(t, result.Symbols, "ui.form._init", "method")
+	assertHasSymbol(t, result.Symbols, "ui.form.buttons", "method")
+}
+
+func TestJSExtendMixin(t *testing.T) {
+	src := `
+dnn.extend(dnn.dom.positioning, {
+    bodyHeight: function () { return 0; },
+    viewPort: function () { return null; },
+});
+`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "dnn.dom.positioning.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHasSymbol(t, result.Symbols, "dnn.dom.positioning", "module")
+	assertHasSymbol(t, result.Symbols, "dnn.dom.positioning.bodyHeight", "method")
+	assertHasSymbol(t, result.Symbols, "dnn.dom.positioning.viewPort", "method")
+}
+
+func TestJSComputedAssignmentSkipped(t *testing.T) {
+	// CKEditor language packs: CKEDITOR.lang['nl'] = {...} — vendor noise that
+	// must not produce symbols.
+	src := `CKEDITOR.lang['nl'] = { editor: "Tekstverwerker" };`
+	p := NewJS()
+	result, err := p.Parse(parser.FileInput{Path: "nl.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Symbols) != 0 {
+		t.Errorf("computed-key assignment should not create symbols, got %v", result.Symbols)
+	}
+}
+
+// --- Service-client API route reconstruction ---
+
+func apiTargets(refs []parser.RawReference) []string {
+	var out []string
+	for _, r := range refs {
+		if r.ReferenceType == "calls_api" {
+			out = append(out, r.ToName)
+		}
+	}
+	return out
+}
+
+func hasTarget(targets []string, want string) bool {
+	for _, t := range targets {
+		if t == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestJSAxiosInstanceBaseURL(t *testing.T) {
+	src := `
+const api = axios.create({ baseURL: "/api/users" });
+function load(id) { return api.get("/" + id); }
+`
+	res, err := NewJS().Parse(parser.FileInput{Path: "userApi.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets := apiTargets(res.References)
+	if !hasTarget(targets, "GET api/users/{*}") {
+		t.Errorf("expected reconstructed route 'GET api/users/{*}', got %v", targets)
+	}
+}
+
+func TestJSDirectBaseConfig(t *testing.T) {
+	src := `
+function call() {
+    const client = makeClient();
+    client.basePath = "orders";
+    client.get("recent");
+}
+`
+	res, err := NewJS().Parse(parser.FileInput{Path: "orders.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets := apiTargets(res.References)
+	if !hasTarget(targets, "GET orders/recent") {
+		t.Errorf("expected 'GET orders/recent', got %v", targets)
+	}
+}
+
+func TestJSFactoryReconstruction(t *testing.T) {
+	// Generic two-segment factory: one literal segment, one bound to a parameter
+	// supplied at the call site. (DNN ServicesFramework is one instance.)
+	src := `
+class Service {
+    getClient(controller) {
+        const c = util.client;
+        c.moduleRoot = "Admin";
+        c.controller = controller;
+        return c;
+    }
+    getThings() {
+        const c = this.getClient("Things");
+        c.get("List?page=1");
+    }
+    saveThing(payload) {
+        const c = this.getClient("Things");
+        c.post("Save", payload);
+    }
+}
+`
+	res, err := NewJS().Parse(parser.FileInput{Path: "service.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets := apiTargets(res.References)
+	for _, want := range []string{"GET Admin/Things/List", "POST Admin/Things/Save"} {
+		if !hasTarget(targets, want) {
+			t.Errorf("expected %q, got %v", want, targets)
+		}
+	}
+}
+
+func TestJSReconstructionDedupesGenericBareRoute(t *testing.T) {
+	// sf is in the generic HTTP-client list AND carries a tracked base; only the
+	// fuller reconstructed route should survive for the call.
+	src := `
+function go() {
+    const sf = build();
+    sf.moduleRoot = "PersonaBar";
+    sf.controller = "Pages";
+    sf.get("GetPageList");
+}
+`
+	res, err := NewJS().Parse(parser.FileInput{Path: "pages.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets := apiTargets(res.References)
+	bare := 0
+	for _, tg := range targets {
+		if tg == "GET GetPageList" {
+			bare++
+		}
+	}
+	if bare != 0 {
+		t.Errorf("bare generic route should be deduped away, got targets %v", targets)
+	}
+	if !hasTarget(targets, "GET PersonaBar/Pages/GetPageList") {
+		t.Errorf("expected reconstructed route, got %v", targets)
+	}
+}
+
+func TestJSURLBuilderReconstruction(t *testing.T) {
+	// Umbraco AngularJS dialect: $http.verb wrapping a getApiUrl(baseKey, action)
+	// helper. The base key is named after the controller (contentApiBaseUrl →
+	// content), so the route reconstructs to content/<action>.
+	src := `
+function contentResource($http, umbRequestHelper) {
+    function getById(id) {
+        return umbRequestHelper.resourcePromise(
+            $http.get(umbRequestHelper.getApiUrl("contentApiBaseUrl", "GetById", { id: id })),
+            "Failed");
+    }
+    function save(content) {
+        return umbRequestHelper.resourcePromise(
+            $http.post(umbRequestHelper.getApiUrl("contentApiBaseUrl", "PostSave"), content),
+            "Failed");
+    }
+    return { getById: getById, save: save };
+}
+`
+	res, err := NewJS().Parse(parser.FileInput{Path: "content.resource.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets := apiTargets(res.References)
+	for _, want := range []string{"GET content/GetById", "POST content/PostSave"} {
+		if !hasTarget(targets, want) {
+			t.Errorf("expected %q, got %v", want, targets)
+		}
+	}
+}
+
+func TestJSURLBuilderFetchVariant(t *testing.T) {
+	src := `function load() { return fetch(buildUrl("usersBaseUrl", "list")); }`
+	res, err := NewJS().Parse(parser.FileInput{Path: "users.js", Content: []byte(src)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasTarget(apiTargets(res.References), "users/list") {
+		t.Errorf("expected 'users/list', got %v", apiTargets(res.References))
+	}
 }

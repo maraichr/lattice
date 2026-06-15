@@ -36,15 +36,9 @@ func NewTraceCrossLanguageHandler(s *store.Store, logger *slog.Logger) *TraceCro
 	return &TraceCrossLanguageHandler{store: s, logger: logger}
 }
 
-type traceNode struct {
-	Symbol     postgres.Symbol
-	Depth      int
-	Via        string  // edge type
-	Confidence float64 // from edge metadata, 0 = unknown
-	FromLang   string  // source symbol language
-}
-
 // Handle traces cross-language paths from a symbol, grouping by stack layer.
+// Only flow edges are followed (calls, reads/writes, joins): language bridges are
+// execution/data transitions, and structural reference edges only add noise.
 func (h *TraceCrossLanguageHandler) Handle(ctx context.Context, params TraceCrossLanguageParams) (string, error) {
 	if params.SymbolID == "" && params.SymbolName == "" {
 		return "", fmt.Errorf("symbol_id or symbol_name is required")
@@ -64,103 +58,37 @@ func (h *TraceCrossLanguageHandler) Handle(ctx context.Context, params TraceCros
 		return "", fmt.Errorf("access denied to project %s", params.Project)
 	}
 
-	seed, err := h.resolveSeed(ctx, project, params)
+	seed, alternates, err := h.resolveSeed(ctx, project, params)
 	if err != nil {
 		return "", err
 	}
 
-	// BFS traversal tracking language transitions
-	visited := map[uuid.UUID]bool{seed.ID: true}
-	var upstream, downstream []traceNode
-	langTransitions := 0
-	var totalConfidence float64
-	confCount := 0
+	var upstream, downstream []TravNode
+	var upStats, downStats TravStats
 
-	// Upstream: follow incoming edges
 	if params.Direction == "upstream" || params.Direction == "full" {
-		queue := []traceNode{{Symbol: seed, Depth: 0}}
-		for len(queue) > 0 {
-			cur := queue[0]
-			queue = queue[1:]
-			if cur.Depth >= params.MaxDepth {
-				continue
-			}
-			edges, err := h.store.GetIncomingEdges(ctx, cur.Symbol.ID)
-			if err != nil {
-				continue
-			}
-			for _, e := range edges {
-				if visited[e.SourceID] {
-					continue
-				}
-				visited[e.SourceID] = true
-				sym, err := h.store.GetSymbol(ctx, e.SourceID)
-				if err != nil {
-					continue
-				}
-				conf := extractEdgeConfidence(e.Metadata)
-				node := traceNode{
-					Symbol:     sym,
-					Depth:      cur.Depth + 1,
-					Via:        e.EdgeType,
-					Confidence: conf,
-					FromLang:   cur.Symbol.Language,
-				}
-				if sym.Language != cur.Symbol.Language {
-					langTransitions++
-					if conf > 0 {
-						totalConfidence += conf
-						confCount++
-					}
-				}
-				upstream = append(upstream, node)
-				queue = append(queue, node)
-			}
+		upstream, upStats, err = TraverseEdges(ctx, h.store, seed, "upstream", params.MaxDepth, FlowEdgeTypes)
+		if err != nil {
+			return "", err
+		}
+	}
+	if params.Direction == "downstream" || params.Direction == "full" {
+		downstream, downStats, err = TraverseEdges(ctx, h.store, seed, "downstream", params.MaxDepth, FlowEdgeTypes)
+		if err != nil {
+			return "", err
 		}
 	}
 
-	// Downstream: follow outgoing edges
-	if params.Direction == "downstream" || params.Direction == "full" {
-		if params.Direction == "full" {
-			visited = map[uuid.UUID]bool{seed.ID: true}
-		}
-		queue := []traceNode{{Symbol: seed, Depth: 0}}
-		for len(queue) > 0 {
-			cur := queue[0]
-			queue = queue[1:]
-			if cur.Depth >= params.MaxDepth {
-				continue
-			}
-			edges, err := h.store.GetOutgoingEdges(ctx, cur.Symbol.ID)
-			if err != nil {
-				continue
-			}
-			for _, e := range edges {
-				if visited[e.TargetID] {
-					continue
-				}
-				visited[e.TargetID] = true
-				sym, err := h.store.GetSymbol(ctx, e.TargetID)
-				if err != nil {
-					continue
-				}
-				conf := extractEdgeConfidence(e.Metadata)
-				node := traceNode{
-					Symbol:     sym,
-					Depth:      cur.Depth + 1,
-					Via:        e.EdgeType,
-					Confidence: conf,
-					FromLang:   cur.Symbol.Language,
-				}
-				if sym.Language != cur.Symbol.Language {
-					langTransitions++
-					if conf > 0 {
-						totalConfidence += conf
-						confCount++
-					}
-				}
-				downstream = append(downstream, node)
-				queue = append(queue, node)
+	// Count language transitions and confidence across both directions.
+	langTransitions := 0
+	var totalConfidence float64
+	confCount := 0
+	for _, n := range append(append([]TravNode{}, upstream...), downstream...) {
+		if n.FromLang != "" && n.Symbol.Language != n.FromLang {
+			langTransitions++
+			if n.Confidence > 0 {
+				totalConfidence += n.Confidence
+				confCount++
 			}
 		}
 	}
@@ -170,10 +98,12 @@ func (h *TraceCrossLanguageHandler) Handle(ctx context.Context, params TraceCros
 	rb.AddHeader(fmt.Sprintf("**Stack Trace: %s** (%s)", seed.Name, params.Direction))
 	rb.AddLine(fmt.Sprintf("Seed: `%s` (%s, %s)", seed.QualifiedName, seed.Kind, seed.Language))
 	rb.AddLine("")
+	AddDisambiguationNote(rb, alternates)
 
 	if len(upstream) > 0 {
 		rb.AddLine("### Upstream (callers / data sources)")
 		formatLayerGrouped(rb, upstream)
+		AddTraversalStats(rb, upStats)
 		rb.AddLine("")
 	}
 
@@ -183,11 +113,12 @@ func (h *TraceCrossLanguageHandler) Handle(ctx context.Context, params TraceCros
 	if len(downstream) > 0 {
 		rb.AddLine("### Downstream (consumers / dependencies)")
 		formatLayerGrouped(rb, downstream)
+		AddTraversalStats(rb, downStats)
 		rb.AddLine("")
 	}
 
 	if len(upstream) == 0 && len(downstream) == 0 {
-		rb.AddLine("No cross-language connections found for this symbol.")
+		rb.AddLine("No cross-language connections found for this symbol (flow edges only: calls, reads, writes, joins).")
 	}
 
 	// Bridge summary
@@ -205,12 +136,12 @@ func (h *TraceCrossLanguageHandler) Handle(ctx context.Context, params TraceCros
 }
 
 // formatLayerGrouped groups nodes by inferred layer and language.
-func formatLayerGrouped(rb *mcp.ResponseBuilder, nodes []traceNode) {
+func formatLayerGrouped(rb *mcp.ResponseBuilder, nodes []TravNode) {
 	// Group by layer
 	type layerGroup struct {
 		layer string
 		lang  string
-		nodes []traceNode
+		nodes []TravNode
 	}
 
 	var groups []layerGroup
@@ -223,7 +154,7 @@ func formatLayerGrouped(rb *mcp.ResponseBuilder, nodes []traceNode) {
 			groups[idx].nodes = append(groups[idx].nodes, n)
 		} else {
 			groupMap[key] = len(groups)
-			groups = append(groups, layerGroup{layer: layer, lang: n.Symbol.Language, nodes: []traceNode{n}})
+			groups = append(groups, layerGroup{layer: layer, lang: n.Symbol.Language, nodes: []TravNode{n}})
 		}
 	}
 
@@ -249,11 +180,12 @@ func formatLayerGrouped(rb *mcp.ResponseBuilder, nodes []traceNode) {
 
 // inferLayer determines the architectural layer from symbol metadata or language.
 func inferLayer(sym postgres.Symbol) string {
-	// Check metadata for pre-computed layer
+	// Check metadata for pre-computed layer; "unknown" falls through to the
+	// language heuristic rather than producing an "Unknown Layer" group.
 	if len(sym.Metadata) > 0 {
 		var meta map[string]interface{}
 		if json.Unmarshal(sym.Metadata, &meta) == nil {
-			if layer, ok := meta["layer"].(string); ok && layer != "" {
+			if layer, ok := meta["layer"].(string); ok && layer != "" && !strings.EqualFold(layer, "unknown") {
 				return layer
 			}
 		}
@@ -297,18 +229,18 @@ func extractEdgeConfidence(metadata []byte) float64 {
 	return 0
 }
 
-func (h *TraceCrossLanguageHandler) resolveSeed(ctx context.Context, project postgres.Project, params TraceCrossLanguageParams) (postgres.Symbol, error) {
+func (h *TraceCrossLanguageHandler) resolveSeed(ctx context.Context, project postgres.Project, params TraceCrossLanguageParams) (postgres.Symbol, []postgres.Symbol, error) {
 	if params.SymbolID != "" {
 		id, err := uuid.Parse(params.SymbolID)
 		if err != nil {
-			return postgres.Symbol{}, fmt.Errorf("invalid symbol_id: %w", err)
+			return postgres.Symbol{}, nil, fmt.Errorf("invalid symbol_id: %w", err)
 		}
 		sym, err := h.store.GetSymbol(ctx, id)
 		if err != nil {
-			return postgres.Symbol{}, WrapSymbolError(err)
+			return postgres.Symbol{}, nil, WrapSymbolError(err)
 		}
-		return sym, nil
+		return sym, nil, nil
 	}
 
-	return ResolveSymbolByName(ctx, h.store, project.Slug, params.SymbolName)
+	return ResolveSymbolByNameDetailed(ctx, h.store, project.Slug, params.SymbolName)
 }

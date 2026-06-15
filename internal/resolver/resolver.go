@@ -358,6 +358,13 @@ type partialSymbolTable struct {
 	ByShortNameFull map[string][]symbolCandidate   // short name → candidates with kind info
 	ByLang          map[string]string              // qualified_name → language
 	BySignature     map[string]uuid.UUID           // endpoint Signature → symbol ID (api_route_match)
+
+	// Case-insensitive indexes, built once after population. These replace the
+	// per-reference O(symbols) linear scans of ByFQN that case-insensitive,
+	// schema-qualified, and cross-language fallbacks would otherwise perform — the
+	// difference between O(refs) and O(refs × symbols) on large projects.
+	lowerShort map[string][]symbolCandidate // lowercased short name → candidates
+	lowerFQN   map[string]uuid.UUID         // lowercased qualified_name → symbol ID
 }
 
 func newPartialTable() *partialSymbolTable {
@@ -367,7 +374,77 @@ func newPartialTable() *partialSymbolTable {
 		ByShortNameFull: make(map[string][]symbolCandidate),
 		ByLang:          make(map[string]string),
 		BySignature:     make(map[string]uuid.UUID),
+		lowerShort:      make(map[string][]symbolCandidate),
+		lowerFQN:        make(map[string]uuid.UUID),
 	}
+}
+
+// buildLowerIndexes populates the case-insensitive lookup maps from the exact
+// maps. Called once after buildPartialTable finishes loading symbols.
+func (t *partialSymbolTable) buildLowerIndexes() {
+	for fqn, id := range t.ByFQN {
+		t.lowerFQN[strings.ToLower(fqn)] = id
+	}
+	for short, cands := range t.ByShortNameFull {
+		l := strings.ToLower(short)
+		t.lowerShort[l] = append(t.lowerShort[l], cands...)
+	}
+}
+
+// lowerShortCandidates and lowerFQNID implement the fastLookup interface.
+func (t *partialSymbolTable) lowerShortCandidates(lower string) []symbolCandidate {
+	return t.lowerShort[lower]
+}
+
+func (t *partialSymbolTable) lowerFQNID(lower string) (uuid.UUID, bool) {
+	id, ok := t.lowerFQN[lower]
+	return id, ok
+}
+
+// fastLookup is implemented by symbol tables that maintain case-insensitive
+// indexes. Resolution helpers use it when available and fall back to a linear
+// scan otherwise (e.g. the small SymbolTable used in tests).
+type fastLookup interface {
+	lowerShortCandidates(lower string) []symbolCandidate
+	lowerFQNID(lower string) (uuid.UUID, bool)
+}
+
+// lookupShortNameCI returns the first symbol whose short name equals name
+// (case-insensitively) and whose language is compatible with targetLang (empty
+// targetLang matches any). It uses the fast index when present, else scans.
+func lookupShortNameCI(table SymbolLookup, name, targetLang string) (uuid.UUID, bool) {
+	lower := strings.ToLower(name)
+	if fast, ok := table.(fastLookup); ok {
+		for _, c := range fast.lowerShortCandidates(lower) {
+			if targetLang == "" || c.Language == "" || matchesLanguage(c.Language, targetLang) {
+				return c.ID, true
+			}
+		}
+		return uuid.Nil, false
+	}
+	for fqn, id := range table.ByFQNMap() {
+		if strings.ToLower(shortNameOf(fqn)) == lower {
+			if targetLang == "" || matchesLanguage(table.LangOf(fqn), targetLang) {
+				return id, true
+			}
+		}
+	}
+	return uuid.Nil, false
+}
+
+// lookupFQNCI returns the symbol whose qualified name equals fqn
+// (case-insensitively). Uses the fast index when present, else scans.
+func lookupFQNCI(table SymbolLookup, fqn string) (uuid.UUID, bool) {
+	lower := strings.ToLower(fqn)
+	if fast, ok := table.(fastLookup); ok {
+		return fast.lowerFQNID(lower)
+	}
+	for cand, id := range table.ByFQNMap() {
+		if strings.ToLower(cand) == lower {
+			return id, true
+		}
+	}
+	return uuid.Nil, false
 }
 
 // buildPartialTable executes targeted batch SQL queries to load only symbols that
@@ -416,6 +493,7 @@ func (e *Engine) buildPartialTable(ctx context.Context, projectID uuid.UUID, fqn
 		}
 	}
 
+	table.buildLowerIndexes()
 	return table, nil
 }
 
@@ -493,12 +571,9 @@ func resolveTarget(ref parser.RawReference, localScope map[string]uuid.UUID, tab
 		}
 	}
 
-	// 4. Try case-insensitive FQN match (SQL is often case-insensitive).
-	lowerTarget := strings.ToLower(ref.ToName)
-	for fqn, id := range byFQN {
-		if strings.ToLower(shortNameOf(fqn)) == lowerTarget {
-			return resolveResult{TargetID: id, Confidence: 1.0, Resolved: true}
-		}
+	// 4. Try case-insensitive short-name match (SQL is often case-insensitive).
+	if id, ok := lookupShortNameCI(table, ref.ToName, ""); ok {
+		return resolveResult{TargetID: id, Confidence: 1.0, Resolved: true}
 	}
 
 	// 5. Try cross-language resolution.

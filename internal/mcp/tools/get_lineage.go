@@ -34,7 +34,9 @@ func NewGetLineageHandler(s *store.Store, logger *slog.Logger) *GetLineageHandle
 	return &GetLineageHandler{store: s, logger: logger}
 }
 
-// Handle traces upstream or downstream lineage from a symbol.
+// Handle traces upstream or downstream lineage from a symbol. Only flow edges
+// (calls, reads/writes, joins) are followed: lineage answers "where does data/control
+// come from or go to", which structural reference edges do not.
 func (h *GetLineageHandler) Handle(ctx context.Context, params GetLineageParams) (string, error) {
 	if params.SymbolID == "" && params.SymbolName == "" {
 		return "", fmt.Errorf("symbol_id or symbol_name is required")
@@ -54,135 +56,91 @@ func (h *GetLineageHandler) Handle(ctx context.Context, params GetLineageParams)
 		return "", fmt.Errorf("access denied to project %s", params.Project)
 	}
 
-	// Resolve the seed symbol
-	seed, err := h.resolveSeed(ctx, project, params)
+	seed, alternates, err := h.resolveSeed(ctx, project, params)
 	if err != nil {
 		return "", err
 	}
 
-	// BFS lineage traversal
-	type lineageNode struct {
-		Symbol     postgres.Symbol
-		Depth      int
-		Via        string  // edge type that led here
-		Confidence float64 // from edge metadata, 0 = unknown
-	}
+	var upstream, downstream []TravNode
+	var upStats, downStats TravStats
 
-	visited := map[uuid.UUID]bool{seed.ID: true}
-	var upstream, downstream []lineageNode
-
-	// Upstream: follow incoming edges
 	if params.Direction == "upstream" || params.Direction == "both" {
-		queue := []lineageNode{{Symbol: seed, Depth: 0}}
-		for len(queue) > 0 {
-			cur := queue[0]
-			queue = queue[1:]
-			if cur.Depth >= params.MaxDepth {
-				continue
-			}
-			edges, err := h.store.GetIncomingEdges(ctx, cur.Symbol.ID)
-			if err != nil {
-				continue
-			}
-			for _, e := range edges {
-				if visited[e.SourceID] {
-					continue
-				}
-				visited[e.SourceID] = true
-				sym, err := h.store.GetSymbol(ctx, e.SourceID)
-				if err != nil {
-					continue
-				}
-				node := lineageNode{Symbol: sym, Depth: cur.Depth + 1, Via: e.EdgeType, Confidence: extractEdgeConfidence(e.Metadata)}
-				upstream = append(upstream, node)
-				queue = append(queue, node)
-			}
+		upstream, upStats, err = TraverseEdges(ctx, h.store, seed, "upstream", params.MaxDepth, FlowEdgeTypes)
+		if err != nil {
+			return "", err
 		}
 	}
-
-	// Downstream: follow outgoing edges
 	if params.Direction == "downstream" || params.Direction == "both" {
-		// Reset visited for downstream except seed
-		if params.Direction == "both" {
-			visited = map[uuid.UUID]bool{seed.ID: true}
-		}
-		queue := []lineageNode{{Symbol: seed, Depth: 0}}
-		for len(queue) > 0 {
-			cur := queue[0]
-			queue = queue[1:]
-			if cur.Depth >= params.MaxDepth {
-				continue
-			}
-			edges, err := h.store.GetOutgoingEdges(ctx, cur.Symbol.ID)
-			if err != nil {
-				continue
-			}
-			for _, e := range edges {
-				if visited[e.TargetID] {
-					continue
-				}
-				visited[e.TargetID] = true
-				sym, err := h.store.GetSymbol(ctx, e.TargetID)
-				if err != nil {
-					continue
-				}
-				node := lineageNode{Symbol: sym, Depth: cur.Depth + 1, Via: e.EdgeType, Confidence: extractEdgeConfidence(e.Metadata)}
-				downstream = append(downstream, node)
-				queue = append(queue, node)
-			}
+		downstream, downStats, err = TraverseEdges(ctx, h.store, seed, "downstream", params.MaxDepth, FlowEdgeTypes)
+		if err != nil {
+			return "", err
 		}
 	}
 
-	// Format response
 	rb := mcp.NewResponseBuilder(4000)
 	rb.AddHeader(fmt.Sprintf("**Lineage for: %s** (%s)", seed.Name, params.Direction))
+	rb.AddLine(fmt.Sprintf("Seed: `%s` (%s, %s)", seed.QualifiedName, seed.Kind, seed.Language))
+	rb.AddLine("")
+	AddDisambiguationNote(rb, alternates)
 
 	if len(upstream) > 0 {
 		rb.AddLine("### Upstream (data sources / callers)")
-		for _, n := range upstream {
-			indent := strings.Repeat("  ", n.Depth)
-			confStr := ""
-			if n.Confidence > 0 {
-				confStr = fmt.Sprintf(", confidence: %.2f", n.Confidence)
-			}
-			rb.AddLine(fmt.Sprintf("%s- %s `%s` [%s] (via %s%s)", indent, n.Symbol.Kind, n.Symbol.Name, n.Symbol.Language, n.Via, confStr))
-		}
+		renderLineageTree(rb, seed.ID, upstream)
+		AddTraversalStats(rb, upStats)
 		rb.AddLine("")
 	}
 
 	if len(downstream) > 0 {
 		rb.AddLine("### Downstream (consumers / dependents)")
-		for _, n := range downstream {
-			indent := strings.Repeat("  ", n.Depth)
-			confStr := ""
-			if n.Confidence > 0 {
-				confStr = fmt.Sprintf(", confidence: %.2f", n.Confidence)
-			}
-			rb.AddLine(fmt.Sprintf("%s- %s `%s` [%s] (via %s%s)", indent, n.Symbol.Kind, n.Symbol.Name, n.Symbol.Language, n.Via, confStr))
-		}
+		renderLineageTree(rb, seed.ID, downstream)
+		AddTraversalStats(rb, downStats)
 		rb.AddLine("")
 	}
 
 	if len(upstream) == 0 && len(downstream) == 0 {
-		rb.AddLine("No lineage connections found for this symbol.")
+		rb.AddLine("No lineage connections found for this symbol (flow edges only: calls, reads, writes, joins).")
 	}
 
-	return rb.Finalize(len(upstream)+len(downstream), len(upstream)+len(downstream)), nil
+	total := len(upstream) + len(downstream)
+	return rb.Finalize(total, total), nil
 }
 
-func (h *GetLineageHandler) resolveSeed(ctx context.Context, project postgres.Project, params GetLineageParams) (postgres.Symbol, error) {
+// renderLineageTree prints nodes in DFS order so children appear under the node
+// they were reached from, rather than in interleaved BFS order.
+func renderLineageTree(rb *mcp.ResponseBuilder, rootID uuid.UUID, nodes []TravNode) {
+	children := make(map[uuid.UUID][]TravNode, len(nodes))
+	for _, n := range nodes {
+		children[n.ParentID] = append(children[n.ParentID], n)
+	}
+
+	var render func(parentID uuid.UUID)
+	render = func(parentID uuid.UUID) {
+		for _, n := range children[parentID] {
+			indent := strings.Repeat("  ", n.Depth-1)
+			confStr := ""
+			if n.Confidence > 0 {
+				confStr = fmt.Sprintf(", confidence: %.2f", n.Confidence)
+			}
+			rb.AddLine(fmt.Sprintf("%s- %s `%s` [%s] (via %s%s)",
+				indent, n.Symbol.Kind, n.Symbol.Name, n.Symbol.Language, n.Via, confStr))
+			render(n.Symbol.ID)
+		}
+	}
+	render(rootID)
+}
+
+func (h *GetLineageHandler) resolveSeed(ctx context.Context, project postgres.Project, params GetLineageParams) (postgres.Symbol, []postgres.Symbol, error) {
 	if params.SymbolID != "" {
 		id, err := uuid.Parse(params.SymbolID)
 		if err != nil {
-			return postgres.Symbol{}, fmt.Errorf("invalid symbol_id: %w", err)
+			return postgres.Symbol{}, nil, fmt.Errorf("invalid symbol_id: %w", err)
 		}
 		sym, err := h.store.GetSymbol(ctx, id)
 		if err != nil {
-			return postgres.Symbol{}, WrapSymbolError(err)
+			return postgres.Symbol{}, nil, WrapSymbolError(err)
 		}
-		return sym, nil
+		return sym, nil, nil
 	}
 
-	// Search by name with ranking
-	return ResolveSymbolByName(ctx, h.store, project.Slug, params.SymbolName)
+	return ResolveSymbolByNameDetailed(ctx, h.store, project.Slug, params.SymbolName)
 }

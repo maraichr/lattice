@@ -141,24 +141,15 @@ func (c *CrossLangResolver) Resolve(ref parser.RawReference, sourceLang string, 
 			}
 
 		case "case_insensitive":
-			lower := strings.ToLower(targetName)
-			for fqn, id := range byFQN {
-				if strings.ToLower(shortNameOf(fqn)) == lower {
-					lang := table.LangOf(fqn)
-					if lang == "" || matchesLanguage(lang, rule.TargetLanguage) {
-						return BridgeMatch{TargetID: id, Confidence: 0.85, Strategy: "case_insensitive", Bridge: bridge}, true
-					}
-				}
+			if id, ok := lookupShortNameCI(table, targetName, rule.TargetLanguage); ok {
+				return BridgeMatch{TargetID: id, Confidence: 0.85, Strategy: "case_insensitive", Bridge: bridge}, true
 			}
 
 		case "schema_qualified":
 			candidates := []string{targetQualified, "dbo." + targetName, targetName}
 			for _, candidate := range candidates {
-				lower := strings.ToLower(candidate)
-				for fqn, id := range byFQN {
-					if strings.ToLower(fqn) == lower {
-						return BridgeMatch{TargetID: id, Confidence: 0.95, Strategy: "schema_qualified", Bridge: bridge}, true
-					}
+				if id, ok := lookupFQNCI(table, candidate); ok {
+					return BridgeMatch{TargetID: id, Confidence: 0.95, Strategy: "schema_qualified", Bridge: bridge}, true
 				}
 			}
 
@@ -167,24 +158,14 @@ func (c *CrossLangResolver) Resolve(ref parser.RawReference, sourceLang string, 
 			if strings.HasPrefix(stripped, "T") && len(stripped) > 1 {
 				stripped = stripped[1:]
 			}
-			lower := strings.ToLower(stripped)
-			for fqn, id := range byFQN {
-				if strings.ToLower(shortNameOf(fqn)) == lower {
-					return BridgeMatch{TargetID: id, Confidence: 0.75, Strategy: "strip_prefix", Bridge: bridge}, true
-				}
+			if id, ok := lookupShortNameCI(table, stripped, ""); ok {
+				return BridgeMatch{TargetID: id, Confidence: 0.75, Strategy: "strip_prefix", Bridge: bridge}, true
 			}
 
 		case "orm_convention":
-			variants := ormNameVariants(targetName)
-			for _, variant := range variants {
-				lower := strings.ToLower(variant)
-				for fqn, id := range byFQN {
-					if strings.ToLower(shortNameOf(fqn)) == lower {
-						lang := table.LangOf(fqn)
-						if lang == "" || matchesLanguage(lang, rule.TargetLanguage) {
-							return BridgeMatch{TargetID: id, Confidence: 0.7, Strategy: "orm_convention", Bridge: bridge}, true
-						}
-					}
+			for _, variant := range ormNameVariants(targetName) {
+				if id, ok := lookupShortNameCI(table, variant, rule.TargetLanguage); ok {
+					return BridgeMatch{TargetID: id, Confidence: 0.7, Strategy: "orm_convention", Bridge: bridge}, true
 				}
 			}
 
@@ -248,7 +229,30 @@ func ormNameVariants(name string) []string {
 }
 
 func matchesLanguage(actual, pattern string) bool {
-	return strings.EqualFold(actual, pattern)
+	return canonicalLang(actual) == canonicalLang(pattern)
+}
+
+// canonicalLang folds the various spellings of a language to one canonical name.
+// Symbols are stored under canonical names (the parser sets them: "javascript",
+// "csharp", …) but raw references carry the file-extension language ("js", "cs",
+// "tsx"). Cross-language rules are written against canonical names, so both sides
+// must be folded before comparison — otherwise a js→csharp rule never fires for a
+// reference whose language is "js".
+func canonicalLang(lang string) string {
+	switch strings.ToLower(strings.TrimSpace(lang)) {
+	case "js", "jsx", "mjs", "cjs", "javascript":
+		return "javascript"
+	case "ts", "tsx", "mts", "cts", "typescript":
+		return "typescript"
+	case "cs", "csharp", "c#":
+		return "csharp"
+	case "tsql", "t-sql":
+		return "tsql"
+	case "pgsql", "postgresql", "postgres":
+		return "pgsql"
+	default:
+		return strings.ToLower(strings.TrimSpace(lang))
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -303,17 +307,87 @@ func normalizeRouteForMatch(route string) string {
 // A match requires:
 //  1. Same HTTP verb prefix (if the reference carries a verb). A reference
 //     without a verb prefix (e.g. plain "/api/users/{p}") matches any verb.
-//  2. Same path after normalisation.
+//  2. Equal paths, OR one path is a trailing-segment suffix of the other.
+//
+// The suffix rule exists because a frontend call almost never carries the full
+// server path: the API root prefix (e.g. "/api", a versioned "/v2", or a service
+// framework's injected service root) is added by the client library at runtime
+// and is invisible in source. So "{controller}/{action}" from the client must be
+// allowed to match "/api/{controller}/{action}" on the server. To keep this from
+// over-matching, a suffix match requires at least two overlapping path segments
+// (typically controller + action) after dropping a leading API-root segment.
 func routeMatches(refNorm, sigNorm string) bool {
 	refVerb, refPath := splitVerbPath(refNorm)
 	sigVerb, sigPath := splitVerbPath(sigNorm)
 
-	// Verb must match if the reference specifies one
+	// Verb must match if both specify one.
 	if refVerb != "" && sigVerb != "" && refVerb != sigVerb {
 		return false
 	}
 
-	return refPath == sigPath
+	if refPath == sigPath {
+		return true
+	}
+
+	refSegs := routeSegments(refPath)
+	sigSegs := routeSegments(sigPath)
+	return segmentsSuffixMatch(refSegs, sigSegs)
+}
+
+// apiRootSegments are leading path segments that denote an API root rather than a
+// resource and are commonly present on the server route but absent from the
+// client call. They are dropped before suffix comparison.
+var apiRootSegments = map[string]bool{
+	"api": true, "apis": true, "rest": true, "services": true,
+	"v1": true, "v2": true, "v3": true, "v4": true,
+}
+
+// routeSegments splits a path into non-empty lowercase segments with a leading
+// API-root segment removed (e.g. "/api/sitesettings/get" → ["sitesettings","get"]).
+func routeSegments(path string) []string {
+	raw := strings.Split(path, "/")
+	segs := make([]string, 0, len(raw))
+	for _, s := range raw {
+		if s != "" {
+			segs = append(segs, s)
+		}
+	}
+	if len(segs) > 0 && apiRootSegments[segs[0]] {
+		segs = segs[1:]
+	}
+	return segs
+}
+
+// segmentsSuffixMatch reports whether one segment list is a trailing suffix of the
+// other, sharing at least two segments. The two-segment floor keeps a bare action
+// name from matching unrelated endpoints while still linking the common
+// controller/action (or resource/id) tail that both sides agree on.
+func segmentsSuffixMatch(a, b []string) bool {
+	shorter, longer := a, b
+	if len(shorter) > len(longer) {
+		shorter, longer = longer, shorter
+	}
+	if len(shorter) < 2 {
+		return false
+	}
+	for i := 1; i <= len(shorter); i++ {
+		if !segmentEqual(longer[len(longer)-i], shorter[len(shorter)-i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// segmentEqual compares two path segments allowing a simple singular/plural
+// difference. Frontend resource keys and backend controller names frequently
+// disagree on plurality (a "userApiBaseUrl" key against a UsersController), so
+// "user" and "users" are treated as the same segment. Only the trailing-"s" form
+// is handled — enough for the common case without the risk of full pluralisation.
+func segmentEqual(a, b string) bool {
+	if a == b {
+		return true
+	}
+	return a == b+"s" || b == a+"s"
 }
 
 // splitVerbPath splits a normalised route string like "get /api/orders/{p}"
